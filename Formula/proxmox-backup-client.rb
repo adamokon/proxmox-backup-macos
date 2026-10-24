@@ -1,7 +1,7 @@
 class ProxmoxBackupClient < Formula
   desc "Native macOS client for Proxmox Backup Server (experimental port)"
   homepage "https://github.com/adamokon/proxmox-backup-macos"
-  license "AGPL-3.0-only"
+  license "AGPL-3.0-or-later"
   head "https://github.com/adamokon/proxmox-backup-macos.git", branch: "codex/macos-client-port"
 
   depends_on "pkgconf" => :build
