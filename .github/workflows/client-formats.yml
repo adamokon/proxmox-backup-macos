@@ -1,9 +1,14 @@
 name: Client format portability
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
 permissions:
   contents: read
 jobs:
   linux-formats:
+    # Own branches are already checked on push; keep PR runs for external forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -16,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.99.1
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev libfuse3-dev
       - run: python3 scripts/macos/apply-patches.py
       # Run outside the source tree to avoid the upstream Debian Cargo redirect.
       - name: Test original format code with server dependencies disabled
