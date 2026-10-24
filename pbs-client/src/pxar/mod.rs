@@ -48,6 +48,8 @@
 //! linked `ENTRY`.
 
 pub(crate) mod create;
+#[cfg(target_os = "macos")]
+mod darwin;
 pub(crate) mod dir_stack;
 pub(crate) mod extract;
 pub(crate) mod look_ahead_cache;

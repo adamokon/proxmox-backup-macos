@@ -1,0 +1,26 @@
+diff --git a/proxmox-time/src/posix.rs b/proxmox-time/src/posix.rs
+index a14f5b40..fb46fec3 100644
+--- a/proxmox-time/src/posix.rs
++++ b/proxmox-time/src/posix.rs
+@@ -44,7 +44,7 @@ fn new_libc_tm() -> libc::tm {
+         tm_yday: 0,
+         tm_isdst: 0,
+         tm_gmtoff: 0,
+-        tm_zone: std::ptr::null(),
++        tm_zone: std::ptr::null_mut(),
+     }
+ }
+ 
+diff --git a/proxmox-time/src/tm_editor.rs b/proxmox-time/src/tm_editor.rs
+index 42c88c4a..e25ca14c 100644
+--- a/proxmox-time/src/tm_editor.rs
++++ b/proxmox-time/src/tm_editor.rs
+@@ -23,7 +23,7 @@ impl TmEditor {
+             tm_yday: 0,
+             tm_isdst: -1,
+             tm_gmtoff: -1,
+-            tm_zone: std::ptr::null(),
++            tm_zone: std::ptr::null_mut(),
+         };
+         Self { utc, t }
+     }

@@ -8,12 +8,15 @@ use pbs_tools::crypt_config::CryptConfig;
 
 use crate::{BufferedDynamicReadAt, BufferedDynamicReader, IndexFile};
 
+type PxarReader = Arc<dyn pxar::accessor::ReadAt + Send + Sync + 'static>;
+type PxarAccessor = pxar::accessor::aio::Accessor<PxarReader>;
+
 pub(crate) async fn get_pxar_fuse_accessor(
     archive_name: &BackupArchiveName,
     client: Arc<BackupReader>,
     manifest: &BackupManifest,
     crypt_config: Option<Arc<CryptConfig>>,
-) -> Result<pbs_pxar_fuse::Accessor, Error> {
+) -> Result<PxarAccessor, Error> {
     let (archive_name, payload_archive_name) =
         pbs_client::tools::get_pxar_archive_names(archive_name, manifest)?;
 
@@ -39,7 +42,7 @@ pub(crate) async fn get_pxar_fuse_accessor(
         pxar::PxarVariant::Unified(reader)
     };
 
-    let accessor = pbs_pxar_fuse::Accessor::new(reader, archive_size).await?;
+    let accessor = PxarAccessor::new(reader, archive_size).await?;
 
     Ok(accessor)
 }
@@ -49,10 +52,10 @@ pub(crate) async fn get_pxar_fuse_reader(
     client: Arc<BackupReader>,
     manifest: &BackupManifest,
     crypt_config: Option<Arc<CryptConfig>>,
-) -> Result<(pbs_pxar_fuse::Reader, u64), Error> {
+) -> Result<(PxarReader, u64), Error> {
     let reader = get_buffered_pxar_reader(archive_name, client, manifest, crypt_config).await?;
     let archive_size = reader.archive_size();
-    let reader: pbs_pxar_fuse::Reader = Arc::new(BufferedDynamicReadAt::new(reader));
+    let reader: PxarReader = Arc::new(BufferedDynamicReadAt::new(reader));
 
     Ok((reader, archive_size))
 }

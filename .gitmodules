@@ -1,0 +1,12 @@
+[submodule "vendor/proxmox"]
+	path = vendor/proxmox
+	url = https://git.proxmox.com/git/proxmox.git
+[submodule "vendor/pxar"]
+	path = vendor/pxar
+	url = https://git.proxmox.com/git/pxar.git
+[submodule "vendor/pathpatterns"]
+	path = vendor/pathpatterns
+	url = https://git.proxmox.com/git/pathpatterns.git
+[submodule "vendor/proxmox-fuse"]
+	path = vendor/proxmox-fuse
+	url = https://git.proxmox.com/git/proxmox-fuse.git

@@ -1,0 +1,32 @@
+name: Client format portability
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  linux-formats:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Official v7.0.1, release and commit checked 2026-10-24.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # Install an explicit Rust release, not the moving stable toolchain.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.99.1
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev
+      - run: python3 scripts/macos/apply-patches.py
+      # Run outside the source tree to avoid the upstream Debian Cargo redirect.
+      - name: Test original format code with server dependencies disabled
+        working-directory: ${{ runner.temp }}
+        run: cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-datastore --no-default-features
+      - name: Test path matching and Unix memory mapping regression
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pathpatterns
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-sys maps_4096_byte_header_on_native_page_size
+      - name: Check Linux client compilation
+        working-directory: ${{ runner.temp }}
+        run: cargo check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client

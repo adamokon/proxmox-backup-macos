@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Error, bail, format_err};
 use bitflags::bitflags;
 use nix::dir::Dir;
-use nix::fcntl::{OFlag, OpenHow, ResolveFlag};
+use nix::fcntl::OFlag;
+#[cfg(not(target_os = "macos"))]
+use nix::fcntl::{OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
 
 use pathpatterns::{MatchEntry, MatchList, MatchType};
@@ -631,12 +633,21 @@ impl Extractor {
         // and does not follow the final component.
         let target_dir = match link.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => {
-                let how = OpenHow::new()
-                    .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-                    .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
-                let fd = nix::fcntl::openat2(root.as_raw_fd(), dir, how)
+                #[cfg(not(target_os = "macos"))]
+                let fd = {
+                    let how = OpenHow::new()
+                        .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                        .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+                    let fd =
+                        nix::fcntl::openat2(root.as_raw_fd(), dir, how).with_context(|| {
+                            format!("failed to open hardlink target directory {dir:?}")
+                        })?;
+                    unsafe { OwnedFd::from_raw_fd(fd) }
+                };
+                #[cfg(target_os = "macos")]
+                let fd = super::darwin::open_directory_beneath(root.as_raw_fd(), dir)
                     .with_context(|| format!("failed to open hardlink target directory {dir:?}"))?;
-                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+                Some(fd)
             }
             _ => None,
         };

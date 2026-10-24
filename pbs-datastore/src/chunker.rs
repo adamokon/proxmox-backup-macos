@@ -477,3 +477,20 @@ fn test_suggested_boundary() {
         assert_eq!(chunk_size, expected);
     }
 }
+
+pub fn verify_chunk_size(size: usize) -> Result<(), anyhow::Error> {
+    static SIZES: [usize; 7] = [
+        64 * 1024,
+        128 * 1024,
+        256 * 1024,
+        512 * 1024,
+        1024 * 1024,
+        2048 * 1024,
+        4096 * 1024,
+    ];
+
+    if !SIZES.contains(&size) {
+        anyhow::bail!("Got unsupported chunk size '{size}'");
+    }
+    Ok(())
+}

@@ -1,0 +1,219 @@
+diff --git a/proxmox-sys/src/fs/xattr.rs b/proxmox-sys/src/fs/xattr.rs
+index 6d85dcd4..d41074a0 100644
+--- a/proxmox-sys/src/fs/xattr.rs
++++ b/proxmox-sys/src/fs/xattr.rs
+@@ -7,6 +7,45 @@ use nix::errno::Errno;
+ 
+ use proxmox_io::vec;
+ 
++// Darwin adds options and (for values) a resource-fork position argument.
++// Keep descriptor-based access: resolving a file path introduces rename races.
++unsafe fn list_attributes(fd: RawFd, buffer: *mut libc::c_char, size: usize) -> isize {
++    #[cfg(target_os = "macos")]
++    return unsafe { libc::flistxattr(fd, buffer, size, 0) };
++    #[cfg(not(target_os = "macos"))]
++    unsafe {
++        libc::flistxattr(fd, buffer, size)
++    }
++}
++
++unsafe fn get_attribute(
++    fd: RawFd,
++    name: *const libc::c_char,
++    buffer: *mut libc::c_void,
++    size: usize,
++) -> isize {
++    #[cfg(target_os = "macos")]
++    return unsafe { libc::fgetxattr(fd, name, buffer, size, 0, 0) };
++    #[cfg(not(target_os = "macos"))]
++    unsafe {
++        libc::fgetxattr(fd, name, buffer, size)
++    }
++}
++
++unsafe fn set_attribute(
++    fd: RawFd,
++    name: *const libc::c_char,
++    buffer: *const libc::c_void,
++    size: usize,
++) -> i32 {
++    #[cfg(target_os = "macos")]
++    return unsafe { libc::fsetxattr(fd, name, buffer, size, 0, 0) };
++    #[cfg(not(target_os = "macos"))]
++    unsafe {
++        libc::fsetxattr(fd, name, buffer, size, 0)
++    }
++}
++
+ /// `"security.capability"` as a CStr to avoid typos.
+ pub const XATTR_NAME_FCAPS: &CStr = c"security.capability";
+ 
+@@ -66,7 +105,7 @@ pub fn flistxattr(fd: RawFd) -> Result<ListXAttr, nix::errno::Errno> {
+     let mut size = 256;
+     let mut buffer = vec::undefined(size);
+     let mut bytes =
+-        unsafe { libc::flistxattr(fd, buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
++        unsafe { list_attributes(fd, buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
+     while bytes < 0 {
+         let err = Errno::last();
+         match err {
+@@ -79,7 +118,7 @@ pub fn flistxattr(fd: RawFd) -> Result<ListXAttr, nix::errno::Errno> {
+         // Retry to read the list with new buffer
+         buffer.resize(size, 0);
+         bytes =
+-            unsafe { libc::flistxattr(fd, buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
++            unsafe { list_attributes(fd, buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
+     }
+     buffer.truncate(bytes as usize);
+ 
+@@ -91,49 +130,52 @@ pub fn flistxattr(fd: RawFd) -> Result<ListXAttr, nix::errno::Errno> {
+ /// Extended attributes may not contain zeroes, which we enforce in the API by using a `&CStr`
+ /// type.
+ pub fn fgetxattr(fd: RawFd, name: &CStr) -> Result<Vec<u8>, nix::errno::Errno> {
+-    let mut size = 256;
+-    let mut buffer = vec::undefined(size);
+-    let mut bytes = unsafe {
+-        libc::fgetxattr(
+-            fd,
+-            name.as_ptr(),
+-            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+-            buffer.len(),
+-        )
+-    };
+-    while bytes < 0 {
+-        let err = Errno::last();
+-        match err {
+-            Errno::ERANGE => {
+-                // Buffer was not big enough to fit the value, retry with double the size
+-                size = size.checked_mul(2).ok_or(Errno::ENOMEM)?;
+-            }
+-            _ => return Err(err),
++    // Resource forks on Darwin may return a successful short prefix instead
++    // of ERANGE. Probe the size, and verify it again after reading. Never treat
++    // that prefix as a complete attribute. A changing file fails after bounded
++    // retries; callers must report the failure rather than omit metadata.
++    for _ in 0..8 {
++        let size = unsafe { get_attribute(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
++        if size < 0 {
++            return Err(Errno::last());
+         }
++        let size = size as usize;
++        // Forks larger than this require streaming archive support. Refuse
++        // explicitly here instead of allocating an unbounded metadata buffer.
++        if size > 64 * 1024 * 1024 {
++            return Err(Errno::E2BIG);
++        }
++        let mut buffer = Vec::new();
++        buffer.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
+         buffer.resize(size, 0);
+-        bytes = unsafe {
+-            libc::fgetxattr(
+-                fd,
+-                name.as_ptr() as *const libc::c_char,
+-                buffer.as_mut_ptr() as *mut core::ffi::c_void,
+-                buffer.len(),
+-            )
+-        };
++        let bytes =
++            unsafe { get_attribute(fd, name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
++        if bytes < 0 {
++            let error = Errno::last();
++            if error == Errno::ERANGE {
++                continue;
++            }
++            return Err(error);
++        }
++        let after = unsafe { get_attribute(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
++        if after < 0 {
++            return Err(Errno::last());
++        }
++        if bytes as usize == size && after as usize == size {
++            return Ok(buffer);
++        }
+     }
+-    buffer.resize(bytes as usize, 0);
+-
+-    Ok(buffer)
++    Err(Errno::EAGAIN)
+ }
+ 
+ /// Set an extended attribute on a file descriptor.
+ pub fn fsetxattr(fd: RawFd, name: &CStr, data: &[u8]) -> Result<(), nix::errno::Errno> {
+     let result = unsafe {
+-        libc::fsetxattr(
++        set_attribute(
+             fd,
+             name.as_ptr(),
+             data.as_ptr() as *const libc::c_void,
+             data.len(),
+-            0,
+         )
+     };
+     if result < 0 {
+@@ -164,14 +206,21 @@ pub fn is_valid_xattr_name(c_name: &CStr) -> bool {
+     if name.is_empty() || name.len() > 255 {
+         return false;
+     }
+-    if name.starts_with(b"user.") || name.starts_with(b"trusted.") {
+-        return true;
+-    }
+-    // samba saves windows ACLs there
+-    if name == b"security.NTACL" {
+-        return true;
++    // Darwin uses unprefixed attribute names, including com.apple.FinderInfo
++    // and com.apple.ResourceFork. The filesystem enforces its own name limit.
++    #[cfg(target_os = "macos")]
++    return true;
++    #[cfg(not(target_os = "macos"))]
++    {
++        if name.starts_with(b"user.") || name.starts_with(b"trusted.") {
++            return true;
++        }
++        // samba saves windows ACLs there
++        if name == b"security.NTACL" {
++            return true;
++        }
++        is_security_capability(c_name)
+     }
+-    is_security_capability(c_name)
+ }
+ 
+ #[cfg(test)]
+@@ -185,9 +234,37 @@ mod tests {
+         let too_long = CString::new(vec![b'a'; 265]).unwrap();
+ 
+         assert!(!is_valid_xattr_name(&too_long));
++        #[cfg(not(target_os = "macos"))]
+         assert!(!is_valid_xattr_name(c"system.attr"));
++        #[cfg(target_os = "macos")]
++        assert!(is_valid_xattr_name(c"com.apple.ResourceFork"));
+         assert!(is_valid_xattr_name(c"user.attr"));
+         assert!(is_valid_xattr_name(c"trusted.attr"));
+         assert!(is_valid_xattr_name(super::XATTR_NAME_FCAPS));
+     }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn darwin_resource_fork_survives_rename_with_open_descriptor() {
++        use std::os::fd::AsRawFd;
++        let root = std::env::temp_dir().join(format!("proxmox-xattr-{}", std::process::id()));
++        std::fs::create_dir(&root).unwrap();
++        let file = std::fs::File::create(root.join("original")).unwrap();
++        let fd = file.as_raw_fd();
++        let value: Vec<u8> = (0..1048576).map(|n| (n % 251) as u8).collect();
++        fsetxattr(fd, c"com.apple.ResourceFork", &value).unwrap();
++        std::fs::rename(root.join("original"), root.join("renamed")).unwrap();
++        let restored = fgetxattr(fd, c"com.apple.ResourceFork").unwrap();
++        assert_eq!(restored.len(), value.len());
++        assert!(restored == value);
++        let names = flistxattr(fd).unwrap();
++        assert!(
++            (&names)
++                .into_iter()
++                .any(|name| name == c"com.apple.ResourceFork")
++        );
++        assert_eq!(fgetxattr(fd, c"org.example.missing"), Err(Errno::ENOATTR));
++        drop(file);
++        std::fs::remove_dir_all(root).unwrap();
++    }
+ }

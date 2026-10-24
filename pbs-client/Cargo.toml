@@ -51,3 +51,9 @@ pxar.workspace = true
 pbs-api-types.workspace = true
 pbs-datastore.workspace = true
 pbs-tools.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+proxmox-sys = { workspace = true, features = ["acl"] }

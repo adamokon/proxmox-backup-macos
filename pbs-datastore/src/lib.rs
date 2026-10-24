@@ -177,12 +177,14 @@ macro_rules! PROXMOX_BACKUP_READER_PROTOCOL_ID_V1 {
     };
 }
 
+#[cfg(feature = "server")]
 pub mod backup_info;
 pub mod cached_chunk_reader;
 pub mod catalog;
 pub mod checksum_reader;
 pub mod checksum_writer;
 pub mod chunk_stat;
+#[cfg(feature = "server")]
 pub mod chunk_store;
 pub mod chunker;
 pub mod crypt_reader;
@@ -192,20 +194,26 @@ pub mod data_blob_reader;
 pub mod file_formats;
 pub mod index;
 pub mod manifest;
+#[cfg(feature = "server")]
 pub mod move_journal;
 pub mod paperkey;
+#[cfg(feature = "server")]
 pub mod prune;
 pub mod read_chunk;
+#[cfg(feature = "server")]
 pub mod s3;
 pub mod store_progress;
+#[cfg(feature = "server")]
 pub mod task_tracking;
 
 pub mod dynamic_index;
 pub mod fixed_index;
 
+#[cfg(feature = "server")]
 pub use backup_info::{BackupDir, BackupGroup, BackupInfo};
 pub use checksum_reader::ChecksumReader;
 pub use checksum_writer::ChecksumWriter;
+#[cfg(feature = "server")]
 pub use chunk_store::ChunkStore;
 pub use chunker::{Chunker, ChunkerImpl, PayloadChunker};
 pub use crypt_reader::CryptReader;
@@ -215,23 +223,33 @@ pub use data_blob_reader::DataBlobReader;
 pub use manifest::BackupManifest;
 pub use store_progress::StoreProgress;
 
+#[cfg(feature = "server")]
 mod datastore;
+#[cfg(feature = "server")]
 pub use datastore::{
     DataStore, DataStoreLookup, DatastoreBackend, S3_CLIENT_REQUEST_COUNTER_BASE_PATH,
     S3_DATASTORE_IN_USE_MARKER, check_backup_owner, check_namespace_depth_limit,
     ensure_datastore_is_mounted, get_datastore_mount_status,
 };
 
+#[cfg(feature = "server")]
 mod hierarchy;
+#[cfg(feature = "server")]
 pub use hierarchy::{
     ListGroups, ListGroupsType, ListNamespaces, ListNamespacesRecursive, ListSnapshots,
 };
 
+#[cfg(feature = "server")]
 mod snapshot_reader;
+#[cfg(feature = "server")]
 pub use snapshot_reader::SnapshotReader;
 
+#[cfg(feature = "server")]
 mod local_chunk_reader;
+#[cfg(feature = "server")]
 pub use local_chunk_reader::LocalChunkReader;
 
+#[cfg(feature = "server")]
 mod local_datastore_lru_cache;
+#[cfg(feature = "server")]
 pub use local_datastore_lru_cache::LocalDatastoreLruCache;

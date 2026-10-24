@@ -273,7 +273,7 @@ impl KeyConfig {
                 let mode = mode.map(|m| m.bits()).unwrap_or(0o0600);
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
-                    .mode(mode)
+                    .mode(mode.into())
                     .create_new(true)
                     .open(path)?;
 

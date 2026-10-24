@@ -55,7 +55,7 @@ use pbs_client::{
     parse_backup_specification, view_task_result,
 };
 use pbs_datastore::catalog::{BackupCatalogWriter, CatalogReader, CatalogWriter};
-use pbs_datastore::chunk_store::verify_chunk_size;
+use pbs_datastore::chunker::verify_chunk_size;
 use pbs_datastore::dynamic_index::{BufferedDynamicReader, DynamicIndexReader, LocalDynamicReadAt};
 use pbs_datastore::fixed_index::FixedIndexReader;
 use pbs_datastore::index::IndexFile;
@@ -80,7 +80,9 @@ pub use group::*;
 mod helper;
 pub(crate) use helper::*;
 
+#[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
 pub use mount::*;
 
 mod snapshot;
@@ -2285,9 +2287,6 @@ fn main() {
         .insert("snapshot", snapshot_mgtm_cli())
         .insert("status", status_cmd_def)
         .insert("key", key::cli())
-        .insert("mount", mount_cmd_def())
-        .insert("map", map_cmd_def())
-        .insert("unmap", unmap_cmd_def())
         .insert("catalog", catalog_mgmt_cli())
         .insert("task", task_mgmt_cli())
         .insert("version", version_cmd_def)
@@ -2299,6 +2298,12 @@ fn main() {
         .alias(&["forget"], &["snapshot", "forget"])
         .alias(&["upload-log"], &["snapshot", "upload-log"])
         .alias(&["snapshots"], &["snapshot", "list"]);
+
+    #[cfg(target_os = "linux")]
+    let cmd_def = cmd_def
+        .insert("mount", mount_cmd_def())
+        .insert("map", map_cmd_def())
+        .insert("unmap", unmap_cmd_def());
 
     let rpcenv = CliEnvironment::new();
     run_cli_command(

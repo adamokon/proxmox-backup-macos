@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "created": "2026-10-24",
+  "purpose": "Complete source histories; no working macOS client release",
+  "upstream_base": "78f77d53718b351bebacfa4f56f85134616e0b02",
+  "archives": [
+    {
+      "name": "proxmox-backup-macos-port-65b0b72504-20261024.bundle",
+      "source_url": "https://git.proxmox.com/git/proxmox-backup.git",
+      "head_commit": "65b0b725046162d5be00aea0ecf9534003105063",
+      "size": 18858719,
+      "sha256": "c48dcead8d135ca4a43daba87daa2ac3d0446088d95c044be141ab93bb728169",
+      "complete_git_history": true
+    },
+    {
+      "name": "proxmox-9b5bf494b1-20261024.bundle",
+      "source_url": "https://git.proxmox.com/git/proxmox.git",
+      "head_commit": "9b5bf494b1759adc0b2db477411a573edf7bce8c",
+      "size": 18584280,
+      "sha256": "92d303fa1c6dc1ea5e7f6383bc0ff4c810079d599e97ddac5805fd86b67c1a24",
+      "complete_git_history": true
+    },
+    {
+      "name": "pxar-091a8a382d-20261024.bundle",
+      "source_url": "https://git.proxmox.com/git/pxar.git",
+      "head_commit": "091a8a382d0d6fc71025351fb35c51b1f3b0074d",
+      "size": 326143,
+      "sha256": "ddbfb1dc8c277ffa85e1a9227a80b858cad81208f08019854fe9758ec85381ff",
+      "complete_git_history": true
+    },
+    {
+      "name": "pathpatterns-5323cbe49a-20261024.bundle",
+      "source_url": "https://git.proxmox.com/git/pathpatterns.git",
+      "head_commit": "5323cbe49ae5d592eb8a3fa2e215550e83dd7fba",
+      "size": 38067,
+      "sha256": "4302afd3e25f6176488a82b8519b0dfc8c6b6ea1266ac3d7d01160494b983d4e",
+      "complete_git_history": true
+    },
+    {
+      "name": "proxmox-fuse-ac99ac97f7-20261024.bundle",
+      "source_url": "https://git.proxmox.com/git/proxmox-fuse.git",
+      "head_commit": "ac99ac97f7c2eb7ab9ee6ec3b41034e68b1eca7d",
+      "size": 61204,
+      "sha256": "5ed7ae9d026df561c273218943628d88c7cdb96a1643cf2126ca00600826a543",
+      "complete_git_history": true
+    }
+  ],
+  "registry_dependencies_included": false,
+  "rust_toolchain_included": false,
+  "native_libraries_included": false,
+  "canonical_port_commit": "65b0b725046162d5be00aea0ecf9534003105063",
+  "upstream_tree": "e220b7c7f2e59275765e4744063a02ce1e0b89ad",
+  "github_baseline_commit": "2ceebaaae1ddb955fa6e4f2cbc40ee3517511c07",
+  "projection_tree_before_provenance": "13c2bd0b4c137e40456567767d4e8cca215b577a"
+}
