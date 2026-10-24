@@ -1,0 +1,72 @@
+diff --git a/proxmox-sys/src/fs/dir.rs b/proxmox-sys/src/fs/dir.rs
+index 10afd4c6..d386ab7d 100644
+--- a/proxmox-sys/src/fs/dir.rs
++++ b/proxmox-sys/src/fs/dir.rs
+@@ -113,6 +113,11 @@ pub fn create_path<P: AsRef<Path>>(
+     create_path_do(path.as_ref(), intermediate_opts, final_opts)
+ }
+ 
++#[cfg(target_os = "macos")]
++const PATH_FLAGS: OFlag = OFlag::from_bits_retain(libc::O_SEARCH | libc::O_CLOEXEC);
++#[cfg(not(target_os = "macos"))]
++const PATH_FLAGS: OFlag = DIR_FLAGS;
++
+ fn create_path_do(
+     path: &Path,
+     intermediate_opts: Option<CreateOptions>,
+@@ -125,7 +130,7 @@ fn create_path_do(
+         Some(Component::Prefix(_)) => bail!("illegal prefix path component encountered"),
+         Some(Component::RootDir) => {
+             let _ = iter.next();
+-            crate::fd::open(c"/", DIR_FLAGS, stat::Mode::empty())?
++            crate::fd::open(c"/", PATH_FLAGS, stat::Mode::empty())?
+         }
+         Some(Component::CurDir) => {
+             let _ = iter.next();
+@@ -133,7 +138,7 @@ fn create_path_do(
+         }
+         Some(Component::ParentDir) => {
+             let _ = iter.next();
+-            crate::fd::open(c"..", DIR_FLAGS, stat::Mode::empty())?
++            crate::fd::open(c"..", PATH_FLAGS, stat::Mode::empty())?
+         }
+         Some(Component::Normal(_)) => {
+             // simply do not advance the iterator, heavy lifting happens in create_path_at_do()
+@@ -159,7 +164,7 @@ fn create_path_at_do(
+             None => return Ok(created),
+ 
+             Some(Component::ParentDir) => {
+-                at = crate::fd::openat(&at, c"..", DIR_FLAGS, stat::Mode::empty())?;
++                at = crate::fd::openat(&at, c"..", PATH_FLAGS, stat::Mode::empty())?;
+             }
+ 
+             Some(Component::Normal(path)) => {
+@@ -175,12 +180,23 @@ fn create_path_at_do(
+                     .and_then(|o| o.perm)
+                     .unwrap_or(stat::Mode::from_bits_truncate(0o755));
+ 
+-                created = match stat::mkdirat(Some(at.as_raw_fd()), path, mode) {
+-                    Err(Errno::EEXIST) => false,
++                // Darwin's sandbox checks mkdir permission even for an already
++                // existing ancestor. Open first; create only a missing component.
++                match crate::fd::openat(&at, path, PATH_FLAGS, stat::Mode::empty()) {
++                    Ok(existing) => {
++                        at = existing;
++                        created = false;
++                    }
++                    Err(Errno::ENOENT) => {
++                        created = match stat::mkdirat(Some(at.as_raw_fd()), path, mode) {
++                            Err(Errno::EEXIST) => false,
++                            Err(e) => return Err(e.into()),
++                            Ok(_) => true,
++                        };
++                        at = crate::fd::openat(&at, path, PATH_FLAGS, stat::Mode::empty())?;
++                    }
+                     Err(e) => return Err(e.into()),
+-                    Ok(_) => true,
+-                };
+-                at = crate::fd::openat(&at, path, DIR_FLAGS, stat::Mode::empty())?;
++                }
+ 
+                 if let (true, Some(opts)) = (created, opts) {
+                     if opts.owner.is_some() || opts.group.is_some() {

@@ -28,7 +28,9 @@ use pxar::{EntryKind, Metadata, PxarVariant};
 use proxmox_human_byte::HumanByte;
 use proxmox_io::vec;
 use proxmox_log::{debug, error, info, warn};
-use proxmox_sys::fs::{self, acl, xattr};
+#[cfg(not(target_os = "macos"))]
+use proxmox_sys::fs::acl;
+use proxmox_sys::fs::{self, xattr};
 
 use pbs_datastore::catalog::BackupCatalogWriter;
 use pbs_datastore::dynamic_index::DynamicIndexReader;
@@ -59,6 +61,8 @@ pub struct PxarCreateOptions {
     pub previous_ref: Option<PxarPrevRef>,
     /// Maximum number of lookahead cache entries
     pub max_cache_size: Option<usize>,
+    #[cfg(target_os = "macos")]
+    pub native_payloads: Option<Arc<super::darwin_archive::NativePayloads>>,
 }
 
 pub type MetadataArchiveReader = Arc<dyn ReadAt + Send + Sync + 'static>;
@@ -79,7 +83,14 @@ fn detect_fs_type(fd: RawFd) -> Result<i64, Errno> {
     Errno::result(res)?;
     let fs_stat = unsafe { fs_stat.assume_init() };
 
-    Ok(fs_stat.f_type)
+    #[cfg(target_os = "macos")]
+    {
+        let name = unsafe { CStr::from_ptr(fs_stat.f_fstypename.as_ptr()) }.to_bytes();
+        if matches!(name, b"devfs" | b"autofs" | b"fdesc" | b"volfs" | b"procfs") {
+            return Ok(-1);
+        }
+    }
+    Ok(fs_stat.f_type as i64)
 }
 
 fn strip_ascii_whitespace(line: &[u8]) -> &[u8] {
@@ -93,6 +104,7 @@ fn strip_ascii_whitespace(line: &[u8]) -> &[u8] {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[rustfmt::skip]
 pub fn is_virtual_file_system(magic: i64) -> bool {
     use proxmox_sys::linux::magic::*;
@@ -115,6 +127,11 @@ pub fn is_virtual_file_system(magic: i64) -> bool {
         SELINUX_MAGIC |
         SMACK_MAGIC |
         SYSFS_MAGIC)
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_virtual_file_system(magic: i64) -> bool {
+    magic == -1
 }
 
 trait UniqueContext<T> {
@@ -195,6 +212,10 @@ struct Archiver {
     last_reusable_offset: Option<u64>,
     reuse_stats: ReuseStats,
     split_archive: bool,
+    #[cfg(target_os = "macos")]
+    native_payloads: Option<Arc<super::darwin_archive::NativePayloads>>,
+    #[cfg(target_os = "macos")]
+    symlink_targets: HashMap<HardLinkInfo, std::ffi::OsString>,
 }
 
 type Encoder<'a, T> = pxar::encoder::aio::Encoder<'a, T>;
@@ -234,19 +255,20 @@ where
     let mut fs_feature_flags = Flags::from_magic(fs_magic);
 
     let stat = nix::sys::stat::fstat(source_dir.as_raw_fd())?;
-    let metadata = get_metadata(
+    let metadata = get_metadata_with_options(
         source_dir.as_raw_fd(),
         &stat,
         feature_flags & fs_feature_flags,
         fs_magic,
         &mut fs_feature_flags,
         options.skip_e2big_xattr,
+        &options,
     )
     .context("failed to get metadata for source directory")?;
 
     let mut device_set = options.device_set.clone();
     if let Some(ref mut set) = device_set {
-        set.insert(stat.st_dev);
+        set.insert(stat.st_dev as u64);
     }
 
     let mut patterns = options.patterns;
@@ -306,6 +328,10 @@ where
         last_reusable_offset: None,
         reuse_stats: ReuseStats::default(),
         split_archive,
+        #[cfg(target_os = "macos")]
+        native_payloads: options.native_payloads,
+        #[cfg(target_os = "macos")]
+        symlink_targets: HashMap::new(),
     };
 
     archiver
@@ -499,7 +525,18 @@ impl Archiver {
         // common flags we always want to use:
         let oflags = oflags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY;
 
+        #[cfg(not(target_os = "macos"))]
         let mut noatime = OFlag::O_NOATIME;
+        #[cfg(target_os = "macos")]
+        let mut noatime = OFlag::empty();
+        #[cfg(target_os = "macos")]
+        let oflags = if oflags.contains(OFlag::from_bits_retain(libc::O_SYMLINK)) {
+            let mut native = oflags;
+            native.remove(OFlag::O_NOFOLLOW);
+            native
+        } else {
+            oflags
+        };
         loop {
             return match proxmox_sys::fd::openat(
                 &parent,
@@ -690,8 +727,8 @@ impl Archiver {
                 .patterns
                 .matches(match_path.as_os_str().as_bytes(), || {
                     Ok::<_, Errno>(match &stat_result {
-                        Some(result) => result.st_mode,
-                        None => stat_result.insert(do_stat()?).st_mode,
+                        Some(result) => result.st_mode as u32,
+                        None => stat_result.insert(do_stat()?).st_mode as u32,
                     })
                 });
 
@@ -775,11 +812,40 @@ impl Archiver {
         c_file_name: &CStr,
         stat: &FileStat,
     ) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        if self
+            .native_payloads
+            .as_ref()
+            .is_some_and(|spool| spool.is_spool(stat))
+        {
+            info!("skipping active native metadata spool: {:?}", self.path);
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if stat.st_flags & 0x40000000 != 0 {
+            bail!(
+                "dataless file must be downloaded before backup: {:?}",
+                self.path
+            );
+        }
         let file_mode = stat.st_mode & libc::S_IFMT;
         let open_mode = if file_mode == libc::S_IFREG || file_mode == libc::S_IFDIR {
             OFlag::empty()
         } else {
-            OFlag::O_PATH
+            {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    OFlag::O_PATH
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    if file_mode == libc::S_IFLNK {
+                        OFlag::from_bits_retain(libc::O_SYMLINK)
+                    } else {
+                        OFlag::from_bits_retain(libc::O_EVTONLY) | OFlag::O_NONBLOCK
+                    }
+                }
+            }
         };
 
         let fd = self.open_file(
@@ -794,14 +860,42 @@ impl Archiver {
             None => return Ok(()),
         };
 
-        let metadata = match get_metadata(
+        #[cfg(target_os = "macos")]
+        if file_mode == libc::S_IFLNK {
+            let target = nix::fcntl::readlinkat(Some(parent), c_file_name)?;
+            let observed = nix::sys::stat::fstatat(
+                Some(parent),
+                c_file_name,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )?;
+            if observed.st_ino != stat.st_ino || observed.st_dev != stat.st_dev {
+                bail!("symlink changed during capture");
+            }
+            self.symlink_targets.insert(
+                HardLinkInfo {
+                    st_dev: stat.st_dev as u64,
+                    st_ino: stat.st_ino,
+                },
+                target,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        let captured = super::darwin_archive::capture(
+            fd.as_raw_fd(),
+            stat,
+            self.flags(),
+            self.native_payloads.as_ref(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let captured = get_metadata(
             fd.as_raw_fd(),
             stat,
             self.flags(),
             self.fs_magic,
             &mut self.fs_feature_flags,
             self.skip_e2big_xattr,
-        ) {
+        );
+        let metadata = match captured {
             Ok(metadata) => metadata,
             Err(err) => {
                 if let Some(Errno::ESTALE) = err.downcast_ref::<Errno>() {
@@ -828,7 +922,7 @@ impl Archiver {
         if metadata.is_regular_file() {
             if stat.st_nlink > 1 {
                 let link_info = HardLinkInfo {
-                    st_dev: stat.st_dev,
+                    st_dev: stat.st_dev as u64,
                     st_ino: stat.st_ino,
                 };
                 if self.cache.contains_hardlink(&link_info) {
@@ -938,7 +1032,7 @@ impl Archiver {
         match metadata.file_type() {
             mode::IFREG => {
                 let link_info = HardLinkInfo {
-                    st_dev: stat.st_dev,
+                    st_dev: stat.st_dev as u64,
                     st_ino: stat.st_ino,
                 };
 
@@ -1273,7 +1367,7 @@ impl Archiver {
             if is_virtual_file_system(self.fs_magic) {
                 skip_contents = true;
             } else if let Some(set) = &self.device_set {
-                skip_contents = !set.contains(&stat.st_dev);
+                skip_contents = !set.contains(&(stat.st_dev as u64));
             }
         }
 
@@ -1326,6 +1420,8 @@ impl Archiver {
         file_size: u64,
     ) -> Result<LinkOffset, Error> {
         let mut file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
+        #[cfg(target_os = "macos")]
+        let before = nix::sys::stat::fstat(file.as_raw_fd())?;
         let mut remaining = file_size;
         let mut out = encoder.create_file(metadata, file_name, file_size).await?;
         while remaining != 0 {
@@ -1336,6 +1432,9 @@ impl Archiver {
                 Err(err) => bail!(err),
             };
             if got as u64 > remaining {
+                #[cfg(target_os = "macos")]
+                bail!("source file grew while being archived: {:?}", self.path);
+                #[cfg(not(target_os = "macos"))]
                 self.report_file_grew_while_reading();
                 got = remaining as usize;
             }
@@ -1343,6 +1442,9 @@ impl Archiver {
             remaining -= got as u64;
         }
         if remaining > 0 {
+            #[cfg(target_os = "macos")]
+            bail!("source file shrank while being archived: {:?}", self.path);
+            #[cfg(not(target_os = "macos"))]
             self.report_file_shrunk_while_reading();
             let to_zero = remaining.min(self.file_copy_buffer.len() as u64) as usize;
             vec::clear(&mut self.file_copy_buffer[..to_zero]);
@@ -1353,6 +1455,28 @@ impl Archiver {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let after = nix::sys::stat::fstat(file.as_raw_fd())?;
+            if (
+                before.st_size,
+                before.st_ctime,
+                before.st_ctime_nsec,
+                before.st_mtime,
+                before.st_mtime_nsec,
+            ) != (
+                after.st_size,
+                after.st_ctime,
+                after.st_ctime_nsec,
+                after.st_mtime,
+                after.st_mtime_nsec,
+            ) || after.st_size as u64 != file_size
+                || (after.st_mtime, after.st_mtime_nsec as u32)
+                    != (metadata.stat.mtime.secs, metadata.stat.mtime.nanos)
+            {
+                bail!("source file changed while being archived: {:?}", self.path);
+            }
+        }
         Ok(out.file_offset())
     }
 
@@ -1363,6 +1487,7 @@ impl Archiver {
         file_name: &Path,
         metadata: &Metadata,
     ) -> Result<(), Error> {
+        #[cfg(not(target_os = "macos"))]
         let dest = match nix::fcntl::readlinkat(Some(fd.as_raw_fd()), &b""[..]) {
             Ok(dest) => dest,
             Err(Errno::ESTALE) => {
@@ -1370,6 +1495,17 @@ impl Archiver {
                 return Ok(());
             }
             Err(err) => return Err(err.into()),
+        };
+        #[cfg(target_os = "macos")]
+        let dest = {
+            let stat = nix::sys::stat::fstat(fd.as_raw_fd())?;
+            self.symlink_targets
+                .get(&HardLinkInfo {
+                    st_dev: stat.st_dev as u64,
+                    st_ino: stat.st_ino,
+                })
+                .context("missing captured symlink target")?
+                .clone()
         };
         encoder.add_symlink(metadata, file_name, dest).await?;
         Ok(())
@@ -1486,6 +1622,28 @@ fn lookup_dynamic_entries(
     Ok((indices, padding_start, padding_end))
 }
 
+fn get_metadata_with_options(
+    fd: RawFd,
+    stat: &FileStat,
+    flags: Flags,
+    magic: i64,
+    fs_flags: &mut Flags,
+    skip: bool,
+    options: &PxarCreateOptions,
+) -> Result<Metadata, Error> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (magic, fs_flags, skip);
+        super::darwin_archive::capture(fd, stat, flags, options.native_payloads.as_ref())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = options;
+        get_metadata(fd, stat, flags, magic, fs_flags, skip)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn get_metadata(
     fd: RawFd,
     stat: &FileStat,
@@ -1522,6 +1680,7 @@ fn get_metadata(
     Ok(meta)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_fcaps(
     meta: &mut Metadata,
     fd: RawFd,
@@ -1547,6 +1706,7 @@ fn get_fcaps(
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_xattr_fcaps_acl(
     meta: &mut Metadata,
     fd: RawFd,
@@ -1616,6 +1776,7 @@ fn get_xattr_fcaps_acl(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_chattr(metadata: &mut Metadata, fd: RawFd) -> Result<(), Error> {
     let mut attr: libc::c_long = 0;
 
@@ -1632,6 +1793,7 @@ fn get_chattr(metadata: &mut Metadata, fd: RawFd) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_fat_attr(metadata: &mut Metadata, fd: RawFd, fs_magic: i64) -> Result<(), Error> {
     use proxmox_sys::linux::magic::*;
 
@@ -1655,6 +1817,7 @@ fn get_fat_attr(metadata: &mut Metadata, fd: RawFd, fs_magic: i64) -> Result<(),
 }
 
 /// Read the quota project id for an inode, supported on ext4/XFS/FUSE/ZFS filesystems
+#[cfg(not(target_os = "macos"))]
 fn get_quota_project_id(
     metadata: &mut Metadata,
     fd: RawFd,
@@ -1696,6 +1859,7 @@ fn get_quota_project_id(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_acl(
     metadata: &mut Metadata,
     proc_path: &Path,
@@ -1719,6 +1883,7 @@ fn get_acl(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_acl_do(
     metadata: &mut Metadata,
     proc_path: &Path,
@@ -1745,6 +1910,7 @@ fn get_acl_do(
     process_acl(metadata, acl, acl_type)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_acl(
     metadata: &mut Metadata,
     acl: acl::ACL,

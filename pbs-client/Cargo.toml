@@ -29,7 +29,6 @@ tokio = { workspace = true, features = [ "fs", "signal" ] }
 tokio-stream.workspace = true
 tower-service.workspace = true
 xdg.workspace = true
-hickory-resolver.workspace = true
 
 pathpatterns.workspace = true
 
@@ -56,4 +55,5 @@ pbs-tools.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+hickory-resolver.workspace = true
 proxmox-sys = { workspace = true, features = ["acl"] }

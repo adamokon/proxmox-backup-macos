@@ -885,7 +885,7 @@ async fn create_backup(
             let path = path.as_str().unwrap();
             let stat = nix::sys::stat::stat(path)
                 .map_err(|err| format_err!("fstat {:?} failed - {}", path, err))?;
-            set.insert(stat.st_dev);
+            set.insert(stat.st_dev as u64);
         }
         devices = Some(set);
     }
@@ -1112,6 +1112,22 @@ async fn create_backup(
         log::info!("{} {} '{}' to '{}' as {}", what, desc, file, repo, target);
     };
 
+    #[cfg(target_os = "macos")]
+    let native_payloads = pbs_client::pxar::darwin_archive::NativePayloads::new()?;
+    #[cfg(target_os = "macos")]
+    let native_payload_archive: BackupArchiveName = (0..=upload_list.len())
+        .map(|n| format!("native-macos-payloads-{n}.pxar.didx"))
+        .find(|candidate| {
+            upload_list
+                .iter()
+                .all(|(_, _, base, ext, _)| format!("{base}.{ext}") != *candidate)
+        })
+        .expect("one more candidate than source archives")
+        .as_str()
+        .try_into()?;
+    #[cfg(target_os = "macos")]
+    let mut native_primary_archives = Vec::new();
+
     for (backup_type, filename, target_base, extension, size) in upload_list {
         let target: BackupArchiveName = format!("{target_base}.{extension}").as_str().try_into()?;
         match (backup_type, dry_run) {
@@ -1244,7 +1260,11 @@ async fn create_backup(
                     skip_e2big_xattr,
                     previous_ref,
                     max_cache_size,
+                    #[cfg(target_os = "macos")]
+                    native_payloads: Some(native_payloads.clone()),
                 };
+                #[cfg(target_os = "macos")]
+                native_primary_archives.push(target.clone());
 
                 let upload_options = UploadOptions {
                     previous_manifest: previous_manifest.clone(),
@@ -1302,6 +1322,61 @@ async fn create_backup(
     if dry_run {
         log::info!("dry-run: no upload happened");
         return Ok(Value::Null);
+    }
+
+    #[cfg(target_os = "macos")]
+    if !native_primary_archives.is_empty() {
+        let (payload_count, payload_bytes) = native_payloads.totals();
+        let payload_archive = if !native_payloads.is_empty() {
+            let pxar = PxarBackupStream::native_payloads(native_payloads.clone())?;
+            let mut chunks = ChunkStream::new(pxar, chunk_size_opt, None, None);
+            let (tx, rx) = mpsc::channel(10);
+            tokio::spawn(async move {
+                while let Some(chunk) = chunks.next().await {
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let stream = ReceiverStream::new(rx).map_err(Error::from);
+            let stats = client
+                .upload_stream(
+                    &native_payload_archive,
+                    stream,
+                    UploadOptions {
+                        previous_manifest: previous_manifest.clone(),
+                        compress: true,
+                        encrypt: crypto.mode == CryptMode::Encrypt,
+                        ..UploadOptions::default()
+                    },
+                    None,
+                )
+                .await?;
+            manifest.add_file(&native_payload_archive, stats.size, stats.csum, crypto.mode)?;
+            Some(native_payload_archive)
+        } else {
+            None
+        };
+        let map = pbs_client::pxar::darwin_archive::NativeBackupMap {
+            version: 1,
+            primary_archives: native_primary_archives,
+            payload_archive,
+            payload_count,
+            payload_bytes,
+        };
+        let name: BackupArchiveName = "macos-metadata.json.blob".try_into()?;
+        let stats = client
+            .upload_blob_from_data(
+                serde_json::to_vec(&map)?,
+                &name,
+                UploadOptions {
+                    compress: true,
+                    encrypt: crypto.mode == CryptMode::Encrypt,
+                    ..UploadOptions::default()
+                },
+            )
+            .await?;
+        manifest.add_file(&name, stats.size, stats.csum, crypto.mode)?;
     }
 
     // finalize and upload catalog
@@ -1945,16 +2020,34 @@ async fn restore(
             };
             let decoder = pxar::decoder::Decoder::from_std(reader)?;
 
-            pbs_client::pxar::extract_archive(
-                decoder,
-                Path::new(target),
-                feature_flags,
-                |path| {
-                    log::debug!("{:?}", path);
-                },
-                options,
+            #[cfg(target_os = "macos")]
+            let native_directory = restore_native_payloads(
+                client.clone(),
+                &manifest,
+                crypt_config.clone(),
+                &archive_name,
+                ignore_xattrs,
             )
-            .map_err(|err| format_err!("error extracting archive - {:#}", err))?;
+            .await?;
+            #[cfg(target_os = "macos")]
+            let native_root = native_directory;
+            let extract = || {
+                pbs_client::pxar::extract_archive(
+                    decoder,
+                    Path::new(target),
+                    feature_flags,
+                    |path| {
+                        log::debug!("{:?}", path);
+                    },
+                    options,
+                )
+            };
+            #[cfg(target_os = "macos")]
+            let extracted =
+                pbs_client::pxar::darwin_archive::with_restore_payloads(native_root, extract);
+            #[cfg(not(target_os = "macos"))]
+            let extracted = extract();
+            extracted.map_err(|err| format_err!("error extracting archive - {:#}", err))?;
             progress.lock().unwrap().finish();
         } else {
             if archive_name.ends_with(".mpxar.didx") || archive_name.ends_with(".ppxar.didx") {
@@ -2311,4 +2404,55 @@ fn main() {
         rpcenv,
         Some(|future| proxmox_async::runtime::main(future)),
     );
+}
+
+#[cfg(target_os = "macos")]
+async fn restore_native_payloads(
+    client: Arc<BackupReader>,
+    manifest: &BackupManifest,
+    crypt: Option<Arc<CryptConfig>>,
+    primary: &BackupArchiveName,
+    ignore_xattrs: bool,
+) -> Result<Option<Arc<pbs_client::pxar::darwin_archive::NativePayloads>>, Error> {
+    let name: BackupArchiveName = "macos-metadata.json.blob".try_into()?;
+    if manifest.lookup_file_info(&name).is_err() {
+        return Ok(None);
+    }
+    let blob = client.download_blob(manifest, &name).await?;
+    let mut data = Vec::new();
+    blob.take(1024 * 1024 + 1).read_to_end(&mut data)?;
+    if data.len() > 1024 * 1024 {
+        bail!("native metadata map exceeds limit");
+    }
+    let map: pbs_client::pxar::darwin_archive::NativeBackupMap = serde_json::from_slice(&data)?;
+    if map.version != 1 || map.primary_archives.len() > 4096 {
+        bail!("invalid native metadata map");
+    }
+    if !map.primary_archives.contains(primary) {
+        return Ok(None);
+    }
+    if ignore_xattrs {
+        // Preserve native ACL/birthtime/flags even when attribute data is ignored.
+        return Ok(Some(
+            pbs_client::pxar::darwin_archive::NativePayloads::new()?
+        ));
+    }
+    let Some(payload_archive) = map.payload_archive else {
+        if map.payload_count != 0 || map.payload_bytes != 0 {
+            bail!("missing native payload archive");
+        }
+        return Ok(Some(
+            pbs_client::pxar::darwin_archive::NativePayloads::new()?
+        ));
+    };
+    let reader = get_buffered_pxar_reader(&payload_archive, client, manifest, crypt).await?;
+    let decoder = pxar::decoder::Decoder::from_std(pxar::PxarVariant::Unified(reader))?;
+    let directory = pbs_client::pxar::darwin_archive::NativePayloads::new()?;
+    pbs_client::pxar::darwin_archive::unpack_payloads(
+        decoder,
+        &directory,
+        map.payload_count,
+        map.payload_bytes,
+    )?;
+    Ok(Some(directory))
 }

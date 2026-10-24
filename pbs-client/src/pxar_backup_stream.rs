@@ -44,6 +44,45 @@ impl Drop for PxarBackupStream {
 }
 
 impl PxarBackupStream {
+    #[cfg(target_os = "macos")]
+    pub fn native_payloads(
+        payloads: Arc<crate::pxar::darwin_archive::NativePayloads>,
+    ) -> Result<Self, Error> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(10);
+        let error = Arc::new(Mutex::new(None));
+        let thread_error = error.clone();
+        let notification = Arc::new(Notify::new());
+        let thread_notification = notification.clone();
+        let (handle, registration) = AbortHandle::new_pair();
+        drop(registration);
+        std::thread::Builder::new()
+            .name("macos-payload-pxar".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    payloads.write_archive(std::io::BufWriter::with_capacity(
+                        256 * 1024,
+                        StdChannelWriter::new(tx),
+                    ))
+                }));
+                let result = match result {
+                    Ok(value) => value,
+                    Err(_) => Err(anyhow::anyhow!("native payload encoder panicked")),
+                };
+                if let Err(failure) = result {
+                    *thread_error.lock().unwrap() = Some(failure);
+                }
+                thread_notification.notify_one();
+            })?;
+        Ok(Self {
+            rx: Some(rx),
+            suggested_boundaries: None,
+            handle: Some(handle),
+            error,
+            finished: false,
+            archiver_finished_notification: notification,
+        })
+    }
+
     pub fn new<W: Write + Send + 'static>(
         dir: Dir,
         catalog: Option<Arc<Mutex<CatalogWriter<W>>>>,
