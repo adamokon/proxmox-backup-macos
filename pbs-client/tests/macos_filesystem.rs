@@ -19,6 +19,17 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
     fs::hard_link(&path, source.join("hardlink"))?;
     symlink("zażółć-🦀", source.join("symlink"))?;
+    let symlink_fd = unsafe {
+        libc::open(
+            std::ffi::CString::new(source.join("symlink").as_os_str().as_encoded_bytes())?.as_ptr(),
+            libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
+        )
+    };
+    assert!(symlink_fd >= 0);
+    assert_eq!(unsafe { libc::fchmod(symlink_fd, 0o751) }, 0);
+    unsafe {
+        libc::close(symlink_fd);
+    }
     fs::create_dir(source.join("nested"))?;
     fs::write(source.join("nested/empty"), [])?;
     let file = File::open(&path)?;
@@ -95,6 +106,10 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
     assert_eq!(
         fs::metadata(&restored)?.ino(),
         fs::metadata(destination.join("hardlink"))?.ino()
+    );
+    assert_eq!(
+        fs::symlink_metadata(source.join("symlink"))?.mode(),
+        fs::symlink_metadata(destination.join("symlink"))?.mode()
     );
     let target = File::open(&restored)?;
     let expected_stat = nix::sys::stat::fstat(fd)?;

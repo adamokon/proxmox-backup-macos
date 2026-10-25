@@ -63,7 +63,9 @@ pub fn apply(
         )
         .context("failed to restore ownership")?;
     }
-    if !metadata.is_symlink() && flags.contains(Flags::WITH_PERMISSIONS) {
+    // Unlike Linux, Darwin stores symlink permissions. An O_SYMLINK descriptor
+    // lets fchmod update the link itself without following its target.
+    if flags.contains(Flags::WITH_PERMISSIONS) {
         nix::sys::stat::fchmod(fd, super::tools::perms_from_metadata(metadata)?)?;
     }
     if let Some(native) = &native {
