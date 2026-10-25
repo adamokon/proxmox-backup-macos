@@ -54,7 +54,8 @@ Build prerequisites are Rust, OpenSSL 3, zstd and pkg-config (Homebrew packages
 `python3 scripts/macos/apply-patches.py`. Cargo must run from outside the source
 tree with an explicit manifest to avoid upstream's Debian registry redirect.
 The [Homebrew formula](Formula/proxmox-backup-client.rb) contains the build recipe;
-its syntax is checked, but an end-to-end Homebrew installation is not yet tested.
+a fresh Homebrew build/install on Apple Silicon and subsequent encrypted and
+unencrypted PBS backup/restore using the installed executable have passed.
 
 The CLI retains the Linux syntax, for example:
 

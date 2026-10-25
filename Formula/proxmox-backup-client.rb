@@ -27,6 +27,7 @@ class ProxmoxBackupClient < Formula
   end
 
   test do
-    assert_match "proxmox-backup-client", shell_output("#{bin}/proxmox-backup-client help 2>&1")
+    assert_match "client version:", shell_output("#{bin}/proxmox-backup-client version 2>&1")
+    assert_match "backup {<backupspec>}", shell_output("#{bin}/proxmox-backup-client help 2>&1")
   end
 end
