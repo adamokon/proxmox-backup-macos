@@ -1,0 +1,378 @@
+diff --git a/proxmox-sys/src/fs/file.rs b/proxmox-sys/src/fs/file.rs
+index d5b3e1e2..792d0ad2 100644
+--- a/proxmox-sys/src/fs/file.rs
++++ b/proxmox-sys/src/fs/file.rs
+@@ -16,7 +16,9 @@ use serde_json::Value;
+ use crate::error::SysError;
+ 
+ #[cfg(feature = "timer")]
+-use crate::{error::SysResult, linux::timer};
++use crate::error::SysResult;
++#[cfg(all(feature = "timer", not(target_os = "macos")))]
++use crate::linux::timer;
+ 
+ use crate::fs::CreateOptions;
+ 
+@@ -121,6 +123,7 @@ pub fn file_read_firstline<P: AsRef<Path>>(path: P) -> Result<String, Error> {
+ ///
+ /// Note that some flags are masked out since they can produce an error, see mkostemp(2) for details.
+ // code is mostly copied from nix mkstemp
++#[cfg(not(target_os = "macos"))]
+ fn mkostemp<P: ?Sized + NixPath>(
+     template: &P,
+     oflag: OFlag,
+@@ -139,6 +142,44 @@ fn mkostemp<P: ?Sized + NixPath>(
+     Ok((fd, PathBuf::from(pathname)))
+ }
+ 
++#[cfg(target_os = "macos")]
++fn mkostemp<P: ?Sized + NixPath>(
++    template: &P,
++    oflag: OFlag,
++) -> nix::Result<(std::os::fd::RawFd, PathBuf)> {
++    use std::os::fd::IntoRawFd;
++    use std::os::unix::ffi::OsStringExt;
++    use std::os::unix::fs::OpenOptionsExt;
++    let mut bytes = template.with_nix_path(|name| name.to_bytes().to_owned())?;
++    if !bytes.ends_with(b"XXXXXX") {
++        return Err(Errno::EINVAL);
++    }
++    let offset = bytes.len() - 6;
++    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++    for _ in 0..128 {
++        for byte in &mut bytes[offset..] {
++            *byte = ALPHABET[unsafe { libc::arc4random_uniform(ALPHABET.len() as u32) } as usize];
++        }
++        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
++        // Rust's open uses O_CLOEXEC atomically. create_new adds O_EXCL and
++        // rejects existing symlinks; do not substitute mkstemp + later fcntl.
++        let flags = oflag & (OFlag::O_APPEND | OFlag::O_SYNC);
++        match std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .custom_flags(flags.bits())
++            .open(&path)
++        {
++            Ok(file) => return Ok((file.into_raw_fd(), path)),
++            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
++            Err(error) => return Err(Errno::from_raw(error.raw_os_error().unwrap_or(libc::EIO))),
++        }
++    }
++    Err(Errno::EEXIST)
++}
++
+ /// Takes a Path and CreateOptions, creates a tmpfile from it and returns
+ /// a RawFd and PathBuf for it
+ pub fn make_tmp_file<P: AsRef<Path>>(
+@@ -228,6 +269,7 @@ pub fn atomic_open_or_create_file<P: AsRef<Path>>(
+ ) -> Result<File, Error> {
+     let path = path.as_ref();
+ 
++    #[cfg(not(target_os = "macos"))]
+     if oflag.contains(OFlag::O_TMPFILE) {
+         bail!("open {:?} failed - unsupported OFlag O_TMPFILE", path);
+     }
+@@ -301,13 +343,23 @@ pub fn atomic_open_or_create_file<P: AsRef<Path>>(
+     let rename_result = temp_file_name.with_nix_path(|c_file_name| {
+         path.with_nix_path(|new_path| unsafe {
+             // This also works on file systems which don't support hardlinks (eg. vfat)
+-            match Errno::result(libc::renameat2(
++            #[cfg(not(target_os = "macos"))]
++            let renamed = Errno::result(libc::renameat2(
+                 libc::AT_FDCWD,
+                 c_file_name.as_ptr(),
+                 libc::AT_FDCWD,
+                 new_path.as_ptr(),
+                 libc::RENAME_NOREPLACE,
+-            )) {
++            ));
++            #[cfg(target_os = "macos")]
++            let renamed = Errno::result(libc::renameatx_np(
++                libc::AT_FDCWD,
++                c_file_name.as_ptr(),
++                libc::AT_FDCWD,
++                new_path.as_ptr(),
++                libc::RENAME_EXCL,
++            ));
++            match renamed {
+                 Err(Errno::EINVAL) => (), // dumb file system, try `link`+`unlink`
+                 other => return other,
+             };
+@@ -381,7 +433,7 @@ pub fn image_size(path: &Path) -> Result<u64, Error> {
+     }
+ }
+ 
+-#[cfg(feature = "timer")]
++#[cfg(all(feature = "timer", not(target_os = "macos")))]
+ /// Create a file lock using fntl. This function allows you to specify
+ /// a timeout if you want to avoid infinite blocking.
+ ///
+@@ -435,6 +487,53 @@ pub fn lock_file<F: AsRawFd>(
+     Ok(())
+ }
+ 
++#[cfg(all(feature = "timer", target_os = "macos"))]
++pub fn lock_file<F: AsRawFd>(
++    file: &mut F,
++    exclusive: bool,
++    timeout: Option<Duration>,
++) -> Result<(), io::Error> {
++    use nix::fcntl::{FlockArg, flock};
++    let Some(timeout) = timeout else {
++        return flock(
++            file.as_raw_fd(),
++            if exclusive {
++                FlockArg::LockExclusive
++            } else {
++                FlockArg::LockShared
++            },
++        )
++        .into_io_result();
++    };
++    let started = std::time::Instant::now();
++    loop {
++        let result = flock(
++            file.as_raw_fd(),
++            if exclusive {
++                FlockArg::LockExclusiveNonblock
++            } else {
++                FlockArg::LockSharedNonblock
++            },
++        );
++        match result {
++            Ok(()) => return Ok(()),
++            Err(Errno::EWOULDBLOCK) if timeout.is_zero() => return result.into_io_result(),
++            Err(Errno::EWOULDBLOCK) | Err(Errno::EINTR) => {}
++            Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
++        }
++        let remaining = timeout
++            .checked_sub(started.elapsed())
++            .filter(|value| !value.is_zero());
++        let Some(remaining) = remaining else {
++            return Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                "file lock timed out",
++            ));
++        };
++        std::thread::sleep(remaining.min(Duration::from_millis(10)));
++    }
++}
++
+ #[cfg(feature = "timer")]
+ /// Open or create a lock file (append mode). Then try to
+ /// acquire a lock using `lock_file()`.
+@@ -499,7 +598,7 @@ mod test {
+             }
+         }
+ 
+-        let dir = TestDir(crate::fs::make_tmp_dir("./tests", None).unwrap());
++        let dir = TestDir(crate::fs::make_tmp_dir(std::env::temp_dir(), None).unwrap());
+         for (index, initial_data) in [b"".as_slice(), b"seed-"].into_iter().enumerate() {
+             for append in [false, true] {
+                 let path = dir.0.join(format!("{index}-{append}"));
+@@ -546,7 +645,11 @@ mod test {
+ 
+     #[test]
+     fn make_tmp_file_does_not_replace_extension() {
+-        let (_, path) = make_tmp_file("/tmp/proxmox-sys-test.json", CreateOptions::new()).unwrap();
++        let (_, path) = make_tmp_file(
++            std::env::temp_dir().join("proxmox-sys-test.json"),
++            CreateOptions::new(),
++        )
++        .unwrap();
+ 
+         assert!(
+             &path
+@@ -557,7 +660,7 @@ mod test {
+         );
+ 
+         let (_, path) = make_tmp_file(
+-            "/tmp/proxmox-sys-test.archive.1000.zst",
++            std::env::temp_dir().join("proxmox-sys-test.archive.1000.zst"),
+             CreateOptions::new(),
+         )
+         .unwrap();
+diff --git a/proxmox-sys/src/fs/mod.rs b/proxmox-sys/src/fs/mod.rs
+index 6cda6326..b681d06e 100644
+--- a/proxmox-sys/src/fs/mod.rs
++++ b/proxmox-sys/src/fs/mod.rs
+@@ -19,7 +19,9 @@ pub use dir::*;
+ mod read_dir;
+ pub use read_dir::*;
+ 
++#[cfg(target_os = "linux")]
+ mod fsx_attr;
++#[cfg(target_os = "linux")]
+ pub use fsx_attr::*;
+ 
+ pub mod xattr;
+@@ -152,6 +154,7 @@ pub struct FileSystemInformation {
+ }
+ 
+ /// Get file system information from path
++#[cfg(not(target_os = "macos"))]
+ pub fn fs_info<P: ?Sized + nix::NixPath>(path: &P) -> nix::Result<FileSystemInformation> {
+     let mut stat: libc::statfs64 = unsafe { std::mem::zeroed() };
+ 
+@@ -174,3 +177,20 @@ pub fn fs_info<P: ?Sized + nix::NixPath>(path: &P) -> nix::Result<FileSystemInfo
+         fs_id: stat.f_fsid,
+     })
+ }
++
++#[cfg(target_os = "macos")]
++pub fn fs_info<P: ?Sized + nix::NixPath>(path: &P) -> nix::Result<FileSystemInformation> {
++    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
++    let res = path.with_nix_path(|cstr| unsafe { libc::statfs(cstr.as_ptr(), &mut stat) })?;
++    nix::errno::Errno::result(res)?;
++    let block_size = u64::from(stat.f_bsize);
++    Ok(FileSystemInformation {
++        total: stat.f_blocks * block_size,
++        used: (stat.f_blocks - stat.f_bfree) * block_size,
++        available: stat.f_bavail * block_size,
++        total_inodes: stat.f_files,
++        free_inodes: stat.f_ffree,
++        fs_type: i64::from(stat.f_type),
++        fs_id: stat.f_fsid,
++    })
++}
+diff --git a/proxmox-sys/src/lib.rs b/proxmox-sys/src/lib.rs
+index d8213438..b363659e 100644
+--- a/proxmox-sys/src/lib.rs
++++ b/proxmox-sys/src/lib.rs
+@@ -5,6 +5,7 @@ use std::os::fd::OwnedFd;
+ use std::os::unix::ffi::OsStrExt;
+ use std::sync::LazyLock;
+ 
++#[cfg(target_os = "linux")]
+ pub mod boot_mode;
+ pub mod command;
+ #[cfg(feature = "crypt")]
+@@ -41,5 +42,10 @@ pub fn nodename() -> &'static str {
+ 
+ /// Wrapper for `nix::unistd::pipe2` defaulting to `O_CLOEXEC`.
+ pub fn pipe() -> Result<(OwnedFd, OwnedFd), nix::Error> {
++    #[cfg(target_os = "macos")]
++    return std::io::pipe()
++        .map(|(reader, writer)| (reader.into(), writer.into()))
++        .map_err(|error| nix::Error::from_raw(error.raw_os_error().unwrap_or(libc::EIO)));
++    #[cfg(not(target_os = "macos"))]
+     nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+ }
+diff --git a/proxmox-sys/src/linux/mod.rs b/proxmox-sys/src/linux/mod.rs
+index cfc85757..280415c4 100644
+--- a/proxmox-sys/src/linux/mod.rs
++++ b/proxmox-sys/src/linux/mod.rs
+@@ -5,10 +5,12 @@ use anyhow::{Error, bail};
+ use proxmox_io::vec;
+ 
+ pub mod magic;
++#[cfg(target_os = "linux")]
+ pub mod pid;
++#[cfg(target_os = "linux")]
+ pub mod procfs;
+ pub mod socket;
+-#[cfg(feature = "timer")]
++#[cfg(all(feature = "timer", target_os = "linux"))]
+ pub mod timer;
+ pub mod tty;
+ 
+@@ -24,22 +26,31 @@ pub fn random_data(size: usize) -> Result<Vec<u8>, Error> {
+ ///
+ /// This code uses the Linux syscall getrandom() - see "man 2 getrandom".
+ pub fn fill_with_random_data(buffer: &mut [u8]) -> Result<(), Error> {
+-    let res = unsafe {
+-        libc::getrandom(
+-            buffer.as_mut_ptr() as *mut libc::c_void,
+-            buffer.len() as libc::size_t,
+-            0_u32,
+-        )
+-    };
+-
+-    if res == -1 {
+-        return Err(std::io::Error::last_os_error().into());
++    #[cfg(target_os = "macos")]
++    {
++        // Darwin's native CSPRNG; unlike getentropy, it has no 256-byte limit.
++        unsafe { libc::arc4random_buf(buffer.as_mut_ptr().cast(), buffer.len()) };
++        return Ok(());
+     }
+-
+-    if res as usize != buffer.len() {
+-        // should not happen
+-        bail!("short getrandom read");
++    #[cfg(not(target_os = "macos"))]
++    {
++        let res = unsafe {
++            libc::getrandom(
++                buffer.as_mut_ptr() as *mut libc::c_void,
++                buffer.len() as libc::size_t,
++                0_u32,
++            )
++        };
++
++        if res == -1 {
++            return Err(std::io::Error::last_os_error().into());
++        }
++
++        if res as usize != buffer.len() {
++            // should not happen
++            bail!("short getrandom read");
++        }
++
++        Ok(())
+     }
+-
+-    Ok(())
+ }
+diff --git a/proxmox-sys/src/linux/socket.rs b/proxmox-sys/src/linux/socket.rs
+index f1f108fb..8f24e63c 100644
+--- a/proxmox-sys/src/linux/socket.rs
++++ b/proxmox-sys/src/linux/socket.rs
+@@ -1,7 +1,11 @@
+ use std::os::fd::AsFd;
+ 
+ use nix::sys::socket::setsockopt;
+-use nix::sys::socket::sockopt::{KeepAlive, TcpKeepIdle};
++use nix::sys::socket::sockopt::KeepAlive;
++#[cfg(target_os = "macos")]
++use nix::sys::socket::sockopt::TcpKeepAlive;
++#[cfg(not(target_os = "macos"))]
++use nix::sys::socket::sockopt::TcpKeepIdle;
+ 
+ /// Set TCP keepalive time on a socket
+ ///
+@@ -10,7 +14,10 @@ use nix::sys::socket::sockopt::{KeepAlive, TcpKeepIdle};
+ /// The default on Linux is 7200 seconds (2 hours) which is far too long for many of our use cases.
+ pub fn set_tcp_keepalive<F: AsFd>(socket_fd: &F, tcp_keepalive_time: u32) -> nix::Result<()> {
+     setsockopt(socket_fd, KeepAlive, &true)?;
++    #[cfg(not(target_os = "macos"))]
+     setsockopt(socket_fd, TcpKeepIdle, &tcp_keepalive_time)?;
++    #[cfg(target_os = "macos")]
++    setsockopt(socket_fd, TcpKeepAlive, &tcp_keepalive_time)?;
+ 
+     Ok(())
+ }
+diff --git a/proxmox-sys/src/process_locker.rs b/proxmox-sys/src/process_locker.rs
+index 0b732ed1..ef7d04e7 100644
+--- a/proxmox-sys/src/process_locker.rs
++++ b/proxmox-sys/src/process_locker.rs
+@@ -145,7 +145,7 @@ impl ProcessLocker {
+         let mut data = locker.lock().unwrap();
+ 
+         if data.writers == 0 && !data.exclusive {
+-            if let Err(err) = Self::try_lock(&data.file, libc::F_RDLCK) {
++            if let Err(err) = Self::try_lock(&data.file, libc::F_RDLCK.into()) {
+                 bail!("unable to get shared lock - {}", err);
+             }
+         }
+@@ -188,7 +188,7 @@ impl ProcessLocker {
+             bail!("already locked exclusively");
+         }
+ 
+-        if let Err(err) = Self::try_lock(&data.file, libc::F_WRLCK) {
++        if let Err(err) = Self::try_lock(&data.file, libc::F_WRLCK.into()) {
+             bail!("unable to get exclusive lock - {}", err);
+         }
+ 

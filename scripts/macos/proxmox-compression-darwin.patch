@@ -1,0 +1,25 @@
+diff --git a/proxmox-compression/src/tar.rs b/proxmox-compression/src/tar.rs
+index 0ec531ff..c06adbf2 100644
+--- a/proxmox-compression/src/tar.rs
++++ b/proxmox-compression/src/tar.rs
+@@ -242,16 +242,16 @@ where
+                     .await?;
+             } else if file_type.is_block_device() {
+                 header.set_entry_type(EntryType::Block);
+-                header.set_device_major(unsafe { libc::major(dev) })?;
+-                header.set_device_minor(unsafe { libc::minor(dev) })?;
++                header.set_device_major(unsafe { libc::major(dev as _) as _ })?;
++                header.set_device_minor(unsafe { libc::minor(dev as _) as _ })?;
+                 header.set_cksum();
+                 encoder
+                     .add_entry(&mut header, entry_path_no_base, tokio::io::empty())
+                     .await?;
+             } else if file_type.is_char_device() {
+                 header.set_entry_type(EntryType::Char);
+-                header.set_device_major(unsafe { libc::major(dev) })?;
+-                header.set_device_minor(unsafe { libc::minor(dev) })?;
++                header.set_device_major(unsafe { libc::major(dev as _) as _ })?;
++                header.set_device_minor(unsafe { libc::minor(dev as _) as _ })?;
+                 header.set_cksum();
+                 encoder
+                     .add_entry(&mut header, entry_path_no_base, tokio::io::empty())

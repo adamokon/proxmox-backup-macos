@@ -40,22 +40,10 @@ pub struct FixedIndexReader {
     pub chunk_size: usize,
     pub size: u64,
     index_length: usize,
-    index: *mut u8,
+    index: proxmox_sys::mmap::Mmap<[u8; 32]>,
     pub uuid: [u8; 16],
     pub ctime: i64,
     pub index_csum: [u8; 32],
-}
-
-// `index` is mmap()ed which cannot be thread-local so should be sendable
-unsafe impl Send for FixedIndexReader {}
-unsafe impl Sync for FixedIndexReader {}
-
-impl Drop for FixedIndexReader {
-    fn drop(&mut self) {
-        if let Err(err) = self.unmap() {
-            log::error!("Unable to unmap file - {}", err);
-        }
-    }
 }
 
 impl FixedIndexReader {
@@ -112,18 +100,14 @@ impl FixedIndexReader {
         let chunk_size = usize::try_from(chunk_size)?;
 
         let data = unsafe {
-            nix::sys::mman::mmap(
-                None,
-                std::num::NonZeroUsize::new(index_size)
-                    .ok_or_else(|| format_err!("invalid index size"))?,
+            proxmox_sys::mmap::Mmap::<[u8; 32]>::map_fd(
+                &file,
+                header_size as u64,
+                index_length,
                 nix::sys::mman::ProtFlags::PROT_READ,
                 nix::sys::mman::MapFlags::MAP_PRIVATE,
-                &file,
-                header_size as i64,
-            )
-        }?
-        .as_ptr()
-        .cast::<u8>();
+            )?
+        };
 
         Ok(Self {
             _file: file,
@@ -136,22 +120,6 @@ impl FixedIndexReader {
             index_csum: header.index_csum,
         })
     }
-
-    fn unmap(&mut self) -> Result<(), Error> {
-        let Some(index) = NonNull::new(self.index as *mut std::ffi::c_void) else {
-            return Ok(());
-        };
-
-        let index_size = self.index_length * 32;
-
-        if let Err(err) = unsafe { nix::sys::mman::munmap(index, index_size) } {
-            bail!("unmap file failed - {}", err);
-        }
-
-        self.index = std::ptr::null_mut();
-
-        Ok(())
-    }
 }
 
 impl IndexFile for FixedIndexReader {
@@ -160,11 +128,7 @@ impl IndexFile for FixedIndexReader {
     }
 
     fn index_digest(&self, pos: usize) -> Option<&[u8; 32]> {
-        if pos >= self.index_length {
-            None
-        } else {
-            Some(unsafe { &*(self.index.add(pos * 32) as *const [u8; 32]) })
-        }
+        self.index.get(pos)
     }
 
     fn index_bytes(&self) -> u64 {
@@ -387,6 +351,7 @@ impl FixedIndexWriter {
 
         nix::unistd::ftruncate(&self.file, new_size)?;
 
+        #[cfg(not(target_os = "macos"))]
         let new_index = unsafe {
             nix::sys::mman::mremap(
                 index_addr,
@@ -396,6 +361,25 @@ impl FixedIndexWriter {
                 None,
             )
         }?;
+
+        #[cfg(target_os = "macos")]
+        let new_index = unsafe {
+            // Darwin has no mremap. Map the resized backing file first so a
+            // failed mmap leaves the previous mapping available for cleanup.
+            let mapped = nix::sys::mman::mmap(
+                None,
+                std::num::NonZeroUsize::new(new_size as usize).unwrap(),
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &self.file,
+                0,
+            )?;
+            if let Err(error) = nix::sys::mman::munmap(index_addr, old_size as usize) {
+                let _ = nix::sys::mman::munmap(mapped, new_size as usize);
+                return Err(error.into());
+            }
+            mapped
+        };
 
         self.memory = Some(MmapPtr(new_index));
         self.index_capacity = new_capacity;

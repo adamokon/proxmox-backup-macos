@@ -1,0 +1,14 @@
+{
+  "upstream": "https://gitlab.com/myrrlyn/endian_trait",
+  "registry_version": "0.6.0",
+  "registry_package_sha256": "77c844962d33db56fe7024846eeb8db92c79ccb68d3752a0ee37c261ac79fd46",
+  "checked": "2026-10-25",
+  "advisory": "RUSTSEC-2021-0039",
+  "upstream_fixed_release_available": false,
+  "local_version": "0.6.1+pbs.1",
+  "changes": [
+    "Panic-safe std array.map; Copy-bound safe slices",
+    "Checked Unicode scalar conversion; forbid unsafe code"
+  ],
+  "license": "MIT"
+}
