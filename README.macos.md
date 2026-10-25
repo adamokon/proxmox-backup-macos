@@ -70,11 +70,12 @@ Use normal PBS encryption key options for client-side encryption. Full Disk
 Access may be needed for protected source directories. Read restore warnings for
 OS-managed attributes. Maintain an independent copy while evaluating the port.
 
-The dependency audit flagged `endian_trait` (RUSTSEC-2021-0039, no fixed upstream
-release). This remains a documented dependency limitation requiring review;
-functional tests do not resolve a library advisory. Hickory is now Linux-only;
-the macOS client uses the system resolver. Linux static DNS dependency upgrades
-are a separate upstream concern. No security certification is claimed.
+The `endian_trait` RUSTSEC-2021-0039 ownership bug is addressed by a local,
+MIT-licensed panic-safe compatibility fork (`vendor/endian-trait-pbs`,
+`0.6.1+pbs.1`). This is not an upstream fixed release. The local override replaces
+unsafe array/slice ownership duplication, checks Unicode scalar conversions and
+forbids unsafe code. See its PATCH-NOTES.md and provenance for the exact changes
+and regression coverage. Hickory is Linux-only; macOS uses the system resolver.
 
 Proxmox licenses and copyright notices remain in force. Upstream contributions
 should follow Proxmox's contribution and mailing-list process after independent

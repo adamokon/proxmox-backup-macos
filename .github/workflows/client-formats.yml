@@ -30,6 +30,7 @@ jobs:
       - name: Test path matching and Unix memory mapping regression
         working-directory: ${{ runner.temp }}
         run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package endian_trait
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pathpatterns
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-sys maps_4096_byte_header_on_native_page_size
       - name: Check Linux client compilation

@@ -28,7 +28,7 @@ repository.workspace = true
 exclude = [ "build", "debian", "tests/catar_data/test_symlink/symlink1"]
 
 [workspace]
-exclude = ["vendor/proxmox", "vendor/pxar", "vendor/pathpatterns", "vendor/proxmox-fuse"]
+exclude = ["vendor/proxmox", "vendor/pxar", "vendor/pathpatterns", "vendor/proxmox-fuse", "vendor/endian-trait-pbs"]
 members = [
     "pbs-buildcfg",
     "pbs-client",
@@ -280,6 +280,7 @@ proxmox-rrd-api-types.workspace = true
 # Local path overrides
 # NOTE: You must run `cargo update` after changing this for it to take effect!
 [patch.crates-io]
+endian_trait = { path = "vendor/endian-trait-pbs" }
 # Official Proxmox sources pinned by .gitmodules and Git submodule commits.
 pathpatterns = { path = "vendor/pathpatterns" }
 pbs-api-types = { path = "vendor/proxmox/pbs-api-types" }
