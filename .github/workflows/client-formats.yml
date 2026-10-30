@@ -36,7 +36,7 @@ jobs:
       - name: Test native PXAR wire format and old-format compatibility
         working-directory: ${{ runner.temp }}
         run: |
-          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pxar --features test-harness
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pxar
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-client --test native_pxar
       - name: Check Linux client compilation
         working-directory: ${{ runner.temp }}

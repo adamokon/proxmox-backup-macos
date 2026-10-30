@@ -57,3 +57,7 @@ tempfile.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 hickory-resolver.workspace = true
 proxmox-sys = { workspace = true, features = ["acl"] }
+
+[dev-dependencies]
+endian_trait.workspace = true
+tempfile.workspace = true

@@ -355,3 +355,8 @@ fn invalid_native_reference_lengths_and_counts_are_bounded() {
     h[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(NativeMetadata::from_header(&h).is_err());
 }
+
+// Run the pinned upstream's old timestamp fixture through the same client test
+// harness; this does not require altering the dependency's excluded workspace.
+#[path = "../../vendor/pxar/tests/compat.rs"]
+mod original_pxar_compat;
