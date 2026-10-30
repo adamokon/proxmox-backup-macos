@@ -33,6 +33,11 @@ jobs:
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package endian_trait
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pathpatterns
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-sys maps_4096_byte_header_on_native_page_size
+      - name: Test native PXAR wire format and old-format compatibility
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pxar
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-client --test native_pxar
       - name: Check Linux client compilation
         working-directory: ${{ runner.temp }}
         run: cargo check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client

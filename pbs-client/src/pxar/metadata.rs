@@ -105,6 +105,11 @@ pub fn apply(
     path_info: &Path,
     on_error: &mut (dyn FnMut(Error) -> Result<(), Error> + Send),
 ) -> Result<(), Error> {
+    if metadata.native.is_some() {
+        anyhow::bail!(
+            "native Darwin/Windows metadata restoration on Linux requires an explicit policy"
+        );
+    }
     let c_proc_path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
     apply_ownership(flags, c_proc_path.as_ptr(), metadata, &mut *on_error)?;
 

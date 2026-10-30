@@ -50,7 +50,7 @@ pub fn apply(
 ) -> Result<(), Error> {
     // Only interpret the reserved envelope when the snapshot manifest/map has
     // opted into native metadata. A Linux user xattr with this name is ordinary data.
-    let native = if darwin_archive::restoring_native_metadata() {
+    let native = if metadata.native.is_some() || darwin_archive::legacy_restore_enabled() {
         darwin_archive::decode(metadata)?
     } else {
         None
