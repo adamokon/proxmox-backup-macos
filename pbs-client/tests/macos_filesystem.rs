@@ -11,6 +11,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 #[test]
 fn native_archive_restore_roundtrip() -> Result<(), Error> {
+    roundtrip(false)
+}
+
+#[test]
+fn native_split_archive_restore_roundtrip() -> Result<(), Error> {
+    roundtrip(true)
+}
+
+fn roundtrip(split: bool) -> Result<(), Error> {
     let sandbox = tempfile::tempdir()?;
     let source = sandbox.path().join("source");
     fs::create_dir(&source)?;
@@ -32,6 +41,12 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
     }
     fs::create_dir(source.join("nested"))?;
     fs::write(source.join("nested/empty"), [])?;
+    let nested = File::open(source.join("nested/empty"))?;
+    proxmox_sys::fs::xattr::fsetxattr(
+        nested.as_raw_fd(),
+        &CString::new("user.nested")?,
+        b"nested-native",
+    )?;
     let file = File::open(&path)?;
     let fd = file.as_raw_fd();
     for (name, value) in [
@@ -50,9 +65,17 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
     assert_eq!(unsafe { libc::fchflags(fd, 0x8001) }, 0);
     let payloads = NativePayloads::new()?;
     let archive = sandbox.path().join("primary.pxar");
-    let writer = pxar::PxarVariant::Unified(pxar::encoder::sync::StandardWriter::new(
-        File::create(&archive)?,
-    ));
+    let payload_archive = sandbox.path().join("data.ppxar");
+    let writer = if split {
+        pxar::PxarVariant::Split(
+            pxar::encoder::sync::StandardWriter::new(File::create(&archive)?),
+            pxar::encoder::sync::StandardWriter::new(File::create(&payload_archive)?),
+        )
+    } else {
+        pxar::PxarVariant::Unified(pxar::encoder::sync::StandardWriter::new(File::create(
+            &archive,
+        )?))
+    };
     let dir = nix::dir::Dir::open(&source, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty())?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(create_archive(
@@ -79,9 +102,18 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
         bytes,
     )?;
     let destination = sandbox.path().join("restored");
-    let decoder =
-        pxar::decoder::Decoder::from_std(pxar::PxarVariant::Unified(File::open(&archive)?))?;
-    with_restore_payloads(Some(restored_payloads.clone()), || {
+    if split {
+        assert!(fs::metadata(&archive)?.len() < 8192);
+    }
+    let input = if split {
+        pxar::PxarVariant::Split(File::open(&archive)?, File::open(&payload_archive)?)
+    } else {
+        pxar::PxarVariant::Unified(File::open(&archive)?)
+    };
+    let decoder = pxar::decoder::Decoder::from_std(input)?;
+    // No manifest map and no preloaded auxiliary archive: the decoder streams
+    // native payloads from the same ordinary/split archive on its own.
+    with_restore_payloads(None, || {
         extract_archive(
             decoder,
             &destination,
@@ -97,6 +129,29 @@ fn native_archive_restore_roundtrip() -> Result<(), Error> {
             },
         )
     })?;
+    if split {
+        let accessor = pxar::accessor::aio::Accessor::new(
+            pxar::PxarVariant::Split(
+                pxar::accessor::sync::FileRefReader::new(std::sync::Arc::new(File::open(
+                    &archive,
+                )?)),
+                (
+                    pxar::accessor::sync::FileRefReader::new(std::sync::Arc::new(File::open(
+                        &payload_archive,
+                    )?)),
+                    fs::metadata(&payload_archive)?.len(),
+                ),
+            ),
+            fs::metadata(&archive)?.len(),
+        );
+        let selective = sandbox.path().join("selective");
+        runtime.block_on(async { extract_sub_dir(&selective, accessor.await?, "nested").await })?;
+        let f = File::open(selective.join("nested/empty"))?;
+        assert_eq!(
+            proxmox_sys::fs::xattr::fgetxattr(f.as_raw_fd(), &CString::new("user.nested")?)?,
+            b"nested-native"
+        );
+    }
     let restored = destination.join("zażółć-🦀");
     assert_eq!(fs::read(&path)?, fs::read(&restored)?);
     assert_eq!(
@@ -220,3 +275,6 @@ fn reject_destination_name_alias_before_truncation() -> Result<(), Error> {
     assert_eq!(fs::read(destination.join("Case"))?, b"safe");
     Ok(())
 }
+
+#[path = "native_pxar.rs"]
+mod native_pxar;

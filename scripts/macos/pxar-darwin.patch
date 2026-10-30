@@ -11,11 +11,559 @@ index eb6dfb1..3a3a8fa 100644
  libc = "0.2"
  
  [features]
+diff --git a/src/accessor/aio.rs b/src/accessor/aio.rs
+index 265d277..8900cd2 100644
+--- a/src/accessor/aio.rs
++++ b/src/accessor/aio.rs
+@@ -231,6 +231,14 @@ pub struct FileEntry<T: Clone + ReadAt> {
+ }
+ 
+ impl<T: Clone + ReadAt> FileEntry<T> {
++    /// Fetch only this entry's native attribute payloads, verifying them in the supplied store.
++    pub async fn materialize_native_metadata(
++        &mut self,
++        store: Arc<dyn crate::format::native::PayloadStore>,
++    ) -> io::Result<()> {
++        self.inner.materialize_native_metadata(store).await
++    }
++
+     /// Get a handle to the subdirectory this file entry points to, if it is in fact a directory.
+     pub async fn enter_directory(&self) -> io::Result<Directory<T>> {
+         Ok(Directory::new(self.inner.enter_directory().await?))
+diff --git a/src/accessor/mod.rs b/src/accessor/mod.rs
+index 5e2169c..b89e177 100644
+--- a/src/accessor/mod.rs
++++ b/src/accessor/mod.rs
+@@ -253,11 +253,20 @@ async fn get_decoder<T: ReadAt>(
+     entry_range: Range<u64>,
+     path: PathBuf,
+ ) -> io::Result<DecoderImpl<SeqReadAtAdapter<T>>> {
++    let header: format::Header = read_entry_at(input.archive(), 0).await?;
++    header.check_header_size()?;
++    let version = if header.htype == format::PXAR_FORMAT_VERSION {
++        FormatVersion::deserialize(read_entry_at(input.archive(), 16).await?)?
++    } else {
++        FormatVersion::Version1
++    };
+     let input = input.wrap_multi(
+         |input| SeqReadAtAdapter::new(input, entry_range.clone()),
+         |(payload_input, range)| SeqReadAtAdapter::new(payload_input, range),
+     );
+-    DecoderImpl::new_full(input, path, true, 0).await
++    let mut decoder = DecoderImpl::new_full(input, path, true, 0).await?;
++    decoder.version = version;
++    Ok(decoder)
+ }
+ 
+ // NOTE: This performs the Decoder::read_next_item() behavior! Keep in mind when changing!
+@@ -755,6 +764,35 @@ pub(crate) struct FileEntryImpl<T: Clone + ReadAt> {
+ }
+ 
+ impl<T: Clone + ReadAt> FileEntryImpl<T> {
++    pub async fn materialize_native_metadata(
++        &mut self,
++        store: Arc<dyn format::native::PayloadStore>,
++    ) -> io::Result<()> {
++        if self.entry.metadata.native.is_none() {
++            return Ok(());
++        }
++        let mut decoder = get_decoder(
++            self.input.clone(),
++            self.entry_range_info.entry_range.clone(),
++            self.entry.path.clone(),
++        )
++        .await?;
++        decoder.native_store = Some(store);
++        loop {
++            let entry = decoder
++                .next()
++                .await
++                .ok_or_else(|| io_format_err!("missing native entry"))??;
++            match entry.kind() {
++                EntryKind::Version(_) | EntryKind::Prelude(_) => continue,
++                _ => {
++                    self.entry.metadata = entry.into_metadata();
++                    return Ok(());
++                }
++            }
++        }
++    }
++
+     pub async fn enter_directory(&self) -> io::Result<DirectoryImpl<T>> {
+         if !self.entry.is_dir() {
+             io_bail!("enter_directory() on a non-directory");
+diff --git a/src/accessor/sync.rs b/src/accessor/sync.rs
+index 3148b57..dcae3cd 100644
+--- a/src/accessor/sync.rs
++++ b/src/accessor/sync.rs
+@@ -285,6 +285,14 @@ pub struct FileEntry<T: Clone + ReadAt> {
+ }
+ 
+ impl<T: Clone + ReadAt> FileEntry<T> {
++    /// Fetch only this entry's native attribute payloads, verifying them in the supplied store.
++    pub fn materialize_native_metadata(
++        &mut self,
++        store: Arc<dyn crate::format::native::PayloadStore>,
++    ) -> io::Result<()> {
++        poll_result_once(self.inner.materialize_native_metadata(store))
++    }
++
+     /// Get a handle to the subdirectory this file entry points to, if it is in fact a directory.
+     pub fn enter_directory(&self) -> io::Result<Directory<T>> {
+         Ok(Directory::new(poll_result_once(
+diff --git a/src/decoder/aio.rs b/src/decoder/aio.rs
+index 1545cd3..5e00834 100644
+--- a/src/decoder/aio.rs
++++ b/src/decoder/aio.rs
+@@ -51,6 +51,14 @@ impl<T: SeqRead> Decoder<T> {
+         Self { inner }
+     }
+ 
++    /// Materialize native payloads into authenticated application-owned storage.
++    pub fn set_native_payload_store(
++        &mut self,
++        store: std::sync::Arc<dyn crate::format::native::PayloadStore>,
++    ) {
++        self.inner.native_store = Some(store);
++    }
++
+     // I would normally agree with clippy, but this is async and we can at most implement Stream,
+     // which we do with feature flags...
+     #[allow(clippy::should_implement_trait)]
+diff --git a/src/decoder/mod.rs b/src/decoder/mod.rs
+index c11087f..d3d8305 100644
+--- a/src/decoder/mod.rs
++++ b/src/decoder/mod.rs
+@@ -174,7 +174,8 @@ pub(crate) struct DecoderImpl<T> {
+     /// entries like FIFOs or sockets, so there we explicitly allow an item to terminate with EOF.
+     eof_after_entry: bool,
+     /// The format version as determined by the format version header
+-    version: format::FormatVersion,
++    pub(crate) version: format::FormatVersion,
++    pub(crate) native_store: Option<std::sync::Arc<dyn format::native::PayloadStore>>,
+ }
+ 
+ #[derive(Clone, PartialEq)]
+@@ -256,6 +257,7 @@ impl<I: SeqRead> DecoderImpl<I> {
+             payload_consumed,
+             eof_after_entry,
+             version: FormatVersion::default(),
++            native_store: None,
+         })
+     }
+ 
+@@ -305,8 +307,9 @@ impl<I: SeqRead> DecoderImpl<I> {
+                     if self.input.payload().is_some() {
+                         // Update consumed payload as given by the offset referenced by the content reader
+                         self.payload_consumed += offset;
+-                    } else {
+-                        // Skip remaining payload of current entry in regular stream
++                    } else if self.current_header.htype == format::PXAR_PAYLOAD {
++                        // PAYLOAD_REF was already consumed in the metadata stream.
++                        // Metadata-only traversal must not skip bytes from the next entry.
+                         self.skip_entry(offset).await?;
+                     }
+                     self.read_next_item().await?;
+@@ -396,6 +399,9 @@ impl<I: SeqRead> DecoderImpl<I> {
+                     *size,
+                 )))
+             } else {
++                if self.current_header.htype == format::PXAR_PAYLOAD_REF {
++                    io_bail!("payload stream required to read split file contents");
++                }
+                 Ok(Some(Contents::new(self.input.archive_mut(), offset, *size)))
+             }
+         } else {
+@@ -570,6 +576,17 @@ impl<I: SeqRead> DecoderImpl<I> {
+     /// Read the next item, the header is already loaded.
+     async fn read_current_item(&mut self) -> io::Result<ItemResult> {
+         match self.current_header.htype {
++            format::PXAR_NATIVE => {
++                if self.version != FormatVersion::NativeDraft
++                    || self.entry.metadata.native.is_some()
++                {
++                    io_bail!("unexpected or duplicate native metadata");
++                }
++                let data = self.read_entry_as_bytes().await?;
++                self.entry.metadata.native =
++                    Some(format::native::NativeMetadata::from_header(&data)?);
++            }
++            format::PXAR_NATIVE_ATTRIBUTE => self.read_native_attribute().await?,
+             format::PXAR_XATTR => {
+                 let xattr = self.read_xattr().await?;
+                 self.entry.metadata.xattrs.push(xattr);
+@@ -754,6 +771,102 @@ impl<I: SeqRead> DecoderImpl<I> {
+     // Read functions for PXAR components.
+     //
+ 
++    async fn read_native_attribute(&mut self) -> io::Result<()> {
++        use format::native::PayloadLocation;
++        let data = self.read_entry_as_bytes().await?;
++        let mut attr = format::native::NativeAttribute::from_descriptor(&data)?;
++        let native = self
++            .entry
++            .metadata
++            .native
++            .as_mut()
++            .ok_or_else(|| io_format_err!("native attribute without metadata"))?;
++        if native.attributes.len() >= format::native::MAX_ATTRIBUTES {
++            io_bail!("too many native attributes");
++        }
++        native.attributes.push(attr.clone());
++        native.validate()?;
++        let mut sink = self
++            .native_store
++            .as_ref()
++            .map(|s| s.writer(attr.digest, attr.size))
++            .transpose()?;
++        let input = match attr.location {
++            PayloadLocation::Archive(offset) => {
++                if let Some(position) = seq_read_position(self.input.archive_mut())
++                    .await
++                    .transpose()?
++                {
++                    if position != offset {
++                        io_bail!("invalid inline native payload offset");
++                    }
++                }
++                self.input.archive_mut()
++            }
++            PayloadLocation::Payload(offset) => {
++                // With no materialization requested, descriptors suffice for
++                // introspection/change detection. Never fetch the payload stream.
++                if sink.is_none() {
++                    return Ok(());
++                }
++                let Some(input) = self.input.payload_mut() else {
++                    if sink.is_some() {
++                        io_bail!("native payload stream required for extraction");
++                    }
++                    return Ok(()); // Fast metadata-only introspection: do not fetch .ppxar.
++                };
++                let end = offset
++                    .checked_add(16)
++                    .and_then(|o| o.checked_add(attr.size))
++                    .ok_or_else(|| io_format_err!("native payload offset overflow"))?;
++                if seq_read_position(input).await.transpose()?.is_some() {
++                    input.update_range(offset..end);
++                } else {
++                    if offset < self.payload_consumed {
++                        io_bail!("native payload references must be monotonic");
++                    }
++                    Self::skip(
++                        input,
++                        usize::try_from(offset - self.payload_consumed).map_err(io_err_other)?,
++                    )
++                    .await?;
++                }
++                self.payload_consumed = end;
++                input
++            }
++            PayloadLocation::Source => unreachable!(),
++        };
++        let header: Header = seq_read_entry(input).await?;
++        header.check_header_size()?;
++        if header.htype != format::PXAR_NATIVE_PAYLOAD || header.content_size() != attr.size {
++            io_bail!("invalid native payload header");
++        }
++        let mut remaining = attr.size;
++        let mut buffer = vec![0u8; 65536];
++        while remaining != 0 {
++            let count = buffer.len().min(remaining as usize);
++            seq_read_exact(input, &mut buffer[..count]).await?;
++            if let Some(sink) = &mut sink {
++                std::io::Write::write_all(sink, &buffer[..count])?;
++            }
++            remaining -= count as u64;
++        }
++        if let Some(sink) = sink {
++            sink.finish()?;
++            attr.location = PayloadLocation::Source;
++            *self
++                .entry
++                .metadata
++                .native
++                .as_mut()
++                .unwrap()
++                .attributes
++                .last_mut()
++                .unwrap() = attr;
++        }
++        Ok(())
++    }
++
+     async fn read_xattr(&mut self) -> io::Result<format::XAttr> {
+         let data = self.read_entry_as_bytes().await?;
+ 
+diff --git a/src/decoder/sync.rs b/src/decoder/sync.rs
+index 862fc9d..a3a8ea3 100644
+--- a/src/decoder/sync.rs
++++ b/src/decoder/sync.rs
+@@ -68,6 +68,14 @@ impl<T: SeqRead> Decoder<T> {
+         Self { inner }
+     }
+ 
++    /// Materialize native payloads into authenticated application-owned storage.
++    pub fn set_native_payload_store(
++        &mut self,
++        store: std::sync::Arc<dyn crate::format::native::PayloadStore>,
++    ) {
++        self.inner.native_store = Some(store);
++    }
++
+     // I would normally agree with clippy, but this here is to be consistent with the async
+     // counterpart, and we *do* implement Iterator as well, so that's fine!
+     #[allow(clippy::should_implement_trait)]
+diff --git a/src/encoder/aio.rs b/src/encoder/aio.rs
+index 66cb7ed..ebfcfa9 100644
+--- a/src/encoder/aio.rs
++++ b/src/encoder/aio.rs
+@@ -66,6 +66,20 @@ impl<'a, T: SeqWrite + 'a> Encoder<'a, T> {
+         })
+     }
+ 
++    /// Opt in to the unallocated native metadata draft. Old encoders stay byte-compatible.
++    pub async fn new_with_native(
++        output: PxarVariant<T, T>,
++        metadata: &Metadata,
++        prelude: Option<&[u8]>,
++        store: std::sync::Arc<dyn format::native::PayloadStore>,
++    ) -> io::Result<Self> {
++        let output = output.wrap_multi(|o| o.into(), |o| o);
++        Ok(Self {
++            inner: encoder::EncoderImpl::new_with_native(output, metadata, prelude, Some(store))
++                .await?,
++        })
++    }
++
+     /// Create a new regular file in the archive. This returns a `File` object to which the
+     /// contents have to be written out *completely*. Failing to do so will put the encoder into an
+     /// error state.
+diff --git a/src/encoder/mod.rs b/src/encoder/mod.rs
+index c0a885e..55e7541 100644
+--- a/src/encoder/mod.rs
++++ b/src/encoder/mod.rs
+@@ -371,6 +371,7 @@ pub(crate) struct EncoderImpl<'a, T: SeqWrite + 'a> {
+     file_copy_buffer: Arc<Mutex<Vec<u8>>>,
+     /// Pxar format version to encode
+     version: format::FormatVersion,
++    native_store: Option<std::sync::Arc<dyn format::native::PayloadStore>>,
+ }
+ 
+ impl<'a, T: SeqWrite + 'a> Drop for EncoderImpl<'a, T> {
+@@ -387,10 +388,19 @@ impl<'a, T: SeqWrite + 'a> Drop for EncoderImpl<'a, T> {
+ 
+ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
+     pub async fn new(
+-        mut output: PxarVariant<EncoderOutput<'a, T>, T>,
++        output: PxarVariant<EncoderOutput<'a, T>, T>,
+         metadata: &Metadata,
+         prelude: Option<&[u8]>,
+     ) -> io::Result<EncoderImpl<'a, T>> {
++        Self::new_with_native(output, metadata, prelude, None).await
++    }
++
++    pub async fn new_with_native(
++        mut output: PxarVariant<EncoderOutput<'a, T>, T>,
++        metadata: &Metadata,
++        prelude: Option<&[u8]>,
++        native_store: Option<std::sync::Arc<dyn format::native::PayloadStore>>,
++    ) -> io::Result<Self> {
+         if !metadata.is_dir() {
+             io_bail!("directory metadata must contain the directory mode flag");
+         }
+@@ -412,7 +422,12 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
+             file_copy_buffer: Arc::new(Mutex::new(unsafe {
+                 crate::util::vec_new_uninitialized(1024 * 1024)
+             })),
+-            version,
++            version: if native_store.is_some() {
++                FormatVersion::NativeDraft
++            } else {
++                version
++            },
++            native_store,
+         };
+ 
+         this.encode_format_version().await?;
+@@ -853,6 +868,12 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
+     }
+ 
+     async fn encode_metadata(&mut self, metadata: &Metadata) -> io::Result<()> {
++        if let Some(native) = &metadata.native {
++            native.validate()?;
++            if self.version != FormatVersion::NativeDraft {
++                io_bail!("native metadata requires the experimental native encoder");
++            }
++        }
+         let (mut output, state) = self.output_state()?;
+         seq_write_pxar_struct_entry(
+             output.archive_mut(),
+@@ -862,6 +883,10 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
+         )
+         .await?;
+ 
++        if let Some(native) = &metadata.native {
++            self.write_native(native).await?;
++        }
++
+         for xattr in &metadata.xattrs {
+             self.write_xattr(xattr).await?;
+         }
+@@ -879,6 +904,71 @@ impl<'a, T: SeqWrite + 'a> EncoderImpl<'a, T> {
+         Ok(())
+     }
+ 
++    async fn write_native(&mut self, native: &format::native::NativeMetadata) -> io::Result<()> {
++        use format::native::PayloadLocation;
++        let store = self
++            .native_store
++            .clone()
++            .ok_or_else(|| io_format_err!("native payload source missing"))?;
++        let (mut output, state) = self.output_state()?;
++        seq_write_pxar_entry(
++            output.archive_mut(),
++            format::PXAR_NATIVE,
++            &native.header()?,
++            &mut state.write_position,
++        )
++        .await?;
++        for original in &native.attributes {
++            if original.location != PayloadLocation::Source {
++                io_bail!("native payload must be materialized before re-encoding");
++            }
++            let mut source = store.reader(original.digest, original.size)?;
++            let mut attr = original.clone();
++            // Descriptor length is fixed independently of its offset value.
++            let descriptor_len = 56 + attr.name.len() as u64;
++            attr.location = if output.payload_mut().is_some() {
++                PayloadLocation::Payload(state.payload_position())
++            } else {
++                PayloadLocation::Archive(
++                    state
++                        .position()
++                        .checked_add(16 + descriptor_len)
++                        .ok_or_else(|| io_format_err!("native offset overflow"))?,
++                )
++            };
++            seq_write_pxar_entry(
++                output.archive_mut(),
++                format::PXAR_NATIVE_ATTRIBUTE,
++                &attr.descriptor()?,
++                &mut state.write_position,
++            )
++            .await?;
++            let (target, position) = match &mut output {
++                PxarVariant::Split(_, payload) => (payload, &mut state.payload_write_position),
++                PxarVariant::Unified(archive) => (archive, &mut state.write_position),
++            };
++            seq_write_struct(
++                target,
++                format::Header::with_content_size(format::PXAR_NATIVE_PAYLOAD, attr.size),
++                position,
++            )
++            .await?;
++            let mut remaining = attr.size;
++            let mut buffer = vec![0u8; 65536];
++            while remaining != 0 {
++                let count = buffer.len().min(remaining as usize);
++                std::io::Read::read_exact(&mut source, &mut buffer[..count])?;
++                seq_write_all(target, &buffer[..count], position).await?;
++                remaining -= count as u64;
++            }
++            // Also drive authentication finalization in application-owned streams.
++            if std::io::Read::read(&mut source, &mut buffer[..1])? != 0 {
++                io_bail!("native payload exceeded declared size");
++            }
++        }
++        Ok(())
++    }
++
+     async fn write_xattr(&mut self, xattr: &format::XAttr) -> io::Result<()> {
+         let (mut output, state) = self.output_state()?;
+         seq_write_pxar_entry(
+diff --git a/src/encoder/sync.rs b/src/encoder/sync.rs
+index ee04b07..26276e4 100644
+--- a/src/encoder/sync.rs
++++ b/src/encoder/sync.rs
+@@ -69,6 +69,24 @@ impl<'a, T: SeqWrite + 'a> Encoder<'a, T> {
+         })
+     }
+ 
++    /// Opt in to the unallocated native metadata draft. Old encoders stay byte-compatible.
++    pub fn new_with_native(
++        output: PxarVariant<T, T>,
++        metadata: &Metadata,
++        prelude: Option<&[u8]>,
++        store: std::sync::Arc<dyn format::native::PayloadStore>,
++    ) -> io::Result<Self> {
++        let output = output.wrap_multi(|o| o.into(), |o| o);
++        Ok(Self {
++            inner: poll_result_once(encoder::EncoderImpl::new_with_native(
++                output,
++                metadata,
++                prelude,
++                Some(store),
++            ))?,
++        })
++    }
++
+     /// Create a new regular file in the archive. This returns a `File` object to which the
+     /// contents have to be written out *completely*. Failing to do so will put the encoder into an
+     /// error state.
 diff --git a/src/format/mod.rs b/src/format/mod.rs
-index e9b9ac9..e59a48f 100644
+index e9b9ac9..9c5b5fd 100644
 --- a/src/format/mod.rs
 +++ b/src/format/mod.rs
-@@ -715,6 +715,16 @@ impl Device {
+@@ -51,6 +51,12 @@ use endian_trait::Endian;
+ use siphasher::sip::SipHasher24;
+ 
+ pub mod acl;
++pub mod native;
++
++// Experimental identifiers, not upstream allocations. See docs/native-pxar-draft.md.
++pub const PXAR_NATIVE: u64 = 0xb1b78c2b1e7a0001;
++pub const PXAR_NATIVE_ATTRIBUTE: u64 = 0xb1b78c2b1e7a0002;
++pub const PXAR_NATIVE_PAYLOAD: u64 = 0xb1b78c2b1e7a0003;
+ 
+ // generated with:
+ // $ echo -n 'PROXMOX ARCHIVE FORMAT' | sha1sum | sed -re 's/^(.{16})(.{16}).*$/0x\1, 0x\2/'
+@@ -148,6 +154,9 @@ impl Header {
+     #[inline]
+     pub fn max_content_size(&self) -> u64 {
+         match self.htype {
++            PXAR_NATIVE => native::MAX_HEADER as u64,
++            PXAR_NATIVE_ATTRIBUTE => 566,
++            PXAR_NATIVE_PAYLOAD => native::MAX_PAYLOAD,
+             PXAR_PRELUDE => u64::MAX - (size_of::<Self>() as u64),
+             // + null-termination
+             PXAR_FILENAME => crate::util::MAX_FILENAME_LEN + 1,
+@@ -563,6 +572,8 @@ pub enum FormatVersion {
+     #[default]
+     Version1,
+     Version2,
++    /// Local draft only: intentionally not assigned the next official version number.
++    NativeDraft,
+ }
+ 
+ impl FormatVersion {
+@@ -570,6 +581,7 @@ impl FormatVersion {
+         match version {
+             1u64 => Ok(FormatVersion::Version1),
+             2u64 => Ok(FormatVersion::Version2),
++            native::DRAFT_VERSION => Ok(FormatVersion::NativeDraft),
+             version => io_bail!("unknown format version {version}"),
+         }
+     }
+@@ -579,6 +591,7 @@ impl FormatVersion {
+             // format version 1 is not to be encoded
+             FormatVersion::Version1 => None,
+             FormatVersion::Version2 => Some(2u64.to_le_bytes().to_vec()),
++            FormatVersion::NativeDraft => Some(native::DRAFT_VERSION.to_le_bytes().to_vec()),
+         }
+     }
+ }
+@@ -715,6 +728,19 @@ impl Device {
      }
  }
  
@@ -25,10 +573,335 @@ index e9b9ac9..e59a48f 100644
 +        libc::makedev(self.major as i32, self.minor as i32)
 +    }
 +    pub fn from_dev_t(dev: libc::dev_t) -> Self {
-+        Self { major: libc::major(dev) as u64, minor: libc::minor(dev) as u64 }
++        Self {
++            major: libc::major(dev) as u64,
++            minor: libc::minor(dev) as u64,
++        }
 +    }
 +}
 +
  #[derive(Clone, Debug)]
  pub struct Prelude {
      pub data: Vec<u8>,
+diff --git a/src/format/native.rs b/src/format/native.rs
+new file mode 100644
+index 0000000..f5b05fe
+--- /dev/null
++++ b/src/format/native.rs
+@@ -0,0 +1,294 @@
++//! Experimental native metadata extension. Wire identifiers are NOT allocated by upstream.
++//! Scalars are little endian; no Rust layout or host ABI is serialized.
++use std::io::{self, Read, Write};
++
++pub const DRAFT_VERSION: u64 = 0x8000_0000_0000_0001;
++pub const MAX_HEADER: usize = 64 * 1024;
++pub const MAX_ATTRIBUTES: usize = 4096;
++pub const MAX_PAYLOAD: u64 = 1 << 40;
++pub const DARWIN_XATTR: u32 = 1;
++pub const WINDOWS_SECURITY: u32 = 0x10001;
++pub const WINDOWS_REPARSE: u32 = 0x10002;
++pub const WINDOWS_STREAM: u32 = 0x10003;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DarwinAce {
++    pub principal: [u8; 16],
++    pub kind: u32,
++    pub flags: u32,
++    pub permissions: u64,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DarwinMetadata {
++    pub birth_seconds: i64,
++    pub birth_nanoseconds: u32,
++    pub flags: u32,
++    /// None means ACLs were excluded; Some(empty) means an explicitly empty ACL.
++    pub acl: Option<(u32, Vec<DarwinAce>)>,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct WindowsMetadata {
++    pub attributes: u32,
++    /// Native FILETIME ticks, including values outside the POSIX timestamp range.
++    pub creation_time: u64,
++    pub access_time: u64,
++    pub write_time: u64,
++    pub change_time: u64,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum PlatformMetadata {
++    Darwin(DarwinMetadata),
++    Windows(WindowsMetadata),
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum PayloadLocation {
++    /// A local, authenticated stream, addressed by digest, supplied to the encoder.
++    Source,
++    /// Payload header offset within the unified archive.
++    Archive(u64),
++    /// Payload header offset within the split .ppxar stream.
++    Payload(u64),
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NativeAttribute {
++    pub kind: u32,
++    pub name: Vec<u8>,
++    pub size: u64,
++    pub digest: [u8; 32],
++    pub location: PayloadLocation,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NativeMetadata {
++    pub platform: PlatformMetadata,
++    pub attributes: Vec<NativeAttribute>,
++}
++
++/// Application-owned encrypted storage. PXAR never creates plaintext temporary files.
++pub trait PayloadStore: Send + Sync {
++    fn reader(&self, digest: [u8; 32], size: u64) -> io::Result<Box<dyn Read + Send>>;
++    fn writer(&self, digest: [u8; 32], size: u64) -> io::Result<Box<dyn PayloadWriter>>;
++}
++pub trait PayloadWriter: Write + Send {
++    /// Verify length/digest/authentication before publishing the stored payload.
++    fn finish(self: Box<Self>) -> io::Result<()>;
++}
++
++fn invalid() -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, "invalid native PXAR metadata")
++}
++struct Cursor<'a>(&'a [u8]);
++impl Cursor<'_> {
++    fn bytes<const N: usize>(&mut self) -> io::Result<[u8; N]> {
++        if self.0.len() < N {
++            return Err(invalid());
++        }
++        let value = self.0[..N].try_into().unwrap();
++        self.0 = &self.0[N..];
++        Ok(value)
++    }
++    fn u32(&mut self) -> io::Result<u32> {
++        Ok(u32::from_le_bytes(self.bytes()?))
++    }
++    fn u64(&mut self) -> io::Result<u64> {
++        Ok(u64::from_le_bytes(self.bytes()?))
++    }
++    fn end(self) -> io::Result<()> {
++        if self.0.is_empty() {
++            Ok(())
++        } else {
++            Err(invalid())
++        }
++    }
++}
++fn u32out(out: &mut Vec<u8>, v: u32) {
++    out.extend_from_slice(&v.to_le_bytes());
++}
++fn u64out(out: &mut Vec<u8>, v: u64) {
++    out.extend_from_slice(&v.to_le_bytes());
++}
++
++impl NativeMetadata {
++    pub fn header(&self) -> io::Result<Vec<u8>> {
++        self.validate()?;
++        let mut out = Vec::new();
++        u32out(&mut out, 1); // extension schema
++        match &self.platform {
++            PlatformMetadata::Darwin(m) => {
++                u32out(&mut out, 1);
++                u64out(&mut out, m.birth_seconds as u64);
++                u32out(&mut out, m.birth_nanoseconds);
++                u32out(&mut out, m.flags);
++                u32out(&mut out, u32::from(m.acl.is_some()));
++                u32out(&mut out, m.acl.as_ref().map_or(0, |a| a.0));
++                u32out(&mut out, m.acl.as_ref().map_or(0, |a| a.1.len() as u32));
++                if let Some((_, entries)) = &m.acl {
++                    for e in entries {
++                        out.extend_from_slice(&e.principal);
++                        u32out(&mut out, e.kind);
++                        u32out(&mut out, e.flags);
++                        u64out(&mut out, e.permissions);
++                    }
++                }
++            }
++            PlatformMetadata::Windows(m) => {
++                u32out(&mut out, 2);
++                u32out(&mut out, m.attributes);
++                for t in [m.creation_time, m.access_time, m.write_time, m.change_time] {
++                    u64out(&mut out, t);
++                }
++            }
++        }
++        Ok(out)
++    }
++    pub fn from_header(data: &[u8]) -> io::Result<Self> {
++        if data.len() > MAX_HEADER {
++            return Err(invalid());
++        }
++        let mut c = Cursor(data);
++        if c.u32()? != 1 {
++            return Err(invalid());
++        }
++        let platform = match c.u32()? {
++            1 => {
++                let birth_seconds = c.u64()? as i64;
++                let birth_nanoseconds = c.u32()?;
++                let flags = c.u32()?;
++                let present = c.u32()?;
++                let acl_flags = c.u32()?;
++                let count = c.u32()?;
++                if present > 1 || count > 128 || (present == 0 && (count != 0 || acl_flags != 0)) {
++                    return Err(invalid());
++                }
++                let mut entries = Vec::new();
++                for _ in 0..count {
++                    entries.push(DarwinAce {
++                        principal: c.bytes()?,
++                        kind: c.u32()?,
++                        flags: c.u32()?,
++                        permissions: c.u64()?,
++                    });
++                }
++                PlatformMetadata::Darwin(DarwinMetadata {
++                    birth_seconds,
++                    birth_nanoseconds,
++                    flags,
++                    acl: (present == 1).then_some((acl_flags, entries)),
++                })
++            }
++            2 => PlatformMetadata::Windows(WindowsMetadata {
++                attributes: c.u32()?,
++                creation_time: c.u64()?,
++                access_time: c.u64()?,
++                write_time: c.u64()?,
++                change_time: c.u64()?,
++            }),
++            _ => return Err(invalid()),
++        };
++        c.end()?;
++        let result = Self {
++            platform,
++            attributes: Vec::new(),
++        };
++        result.validate()?;
++        Ok(result)
++    }
++    pub fn validate(&self) -> io::Result<()> {
++        if self.attributes.len() > MAX_ATTRIBUTES {
++            return Err(invalid());
++        }
++        if let PlatformMetadata::Darwin(m) = &self.platform {
++            if m.birth_nanoseconds >= 1_000_000_000
++                || m.acl.as_ref().is_some_and(|(_, es)| {
++                    es.len() > 128 || es.iter().any(|e| !matches!(e.kind, 1 | 2))
++                })
++            {
++                return Err(invalid());
++            }
++        }
++        let mut names = std::collections::HashSet::new();
++        for a in &self.attributes {
++            if a.size > MAX_PAYLOAD || !names.insert((a.kind, &a.name)) {
++                return Err(invalid());
++            }
++            match &self.platform {
++                PlatformMetadata::Darwin(_)
++                    if a.kind == DARWIN_XATTR
++                        && !a.name.is_empty()
++                        && a.name.len() <= 127
++                        && !a.name.contains(&0) =>
++                {
++                    ()
++                }
++                PlatformMetadata::Windows(_)
++                    if matches!(a.kind, WINDOWS_SECURITY | WINDOWS_REPARSE)
++                        && a.name.is_empty()
++                        && a.size <= MAX_HEADER as u64 =>
++                {
++                    ()
++                }
++                PlatformMetadata::Windows(_)
++                    if a.kind == WINDOWS_STREAM && valid_stream_name(&a.name) =>
++                {
++                    ()
++                }
++                _ => return Err(invalid()),
++            }
++            if let PayloadLocation::Archive(o) | PayloadLocation::Payload(o) = a.location {
++                o.checked_add(16)
++                    .and_then(|o| o.checked_add(a.size))
++                    .ok_or_else(invalid)?;
++            }
++        }
++        Ok(())
++    }
++}
++fn valid_stream_name(name: &[u8]) -> bool {
++    !name.is_empty()
++        && name.len() <= 510
++        && name.len() % 2 == 0
++        && std::char::decode_utf16(
++            name.chunks_exact(2)
++                .map(|x| u16::from_le_bytes([x[0], x[1]])),
++        )
++        .all(|c| c.is_ok_and(|c| !matches!(c, '\0' | '/' | '\\' | ':')))
++}
++impl NativeAttribute {
++    pub fn descriptor(&self) -> io::Result<Vec<u8>> {
++        let (kind, offset) = match self.location {
++            PayloadLocation::Archive(o) => (0, o),
++            PayloadLocation::Payload(o) => (1, o),
++            PayloadLocation::Source => return Err(invalid()),
++        };
++        let mut out = Vec::new();
++        u32out(&mut out, self.kind);
++        u32out(&mut out, kind);
++        u64out(&mut out, offset);
++        u64out(&mut out, self.size);
++        out.extend_from_slice(&self.digest);
++        out.extend_from_slice(&self.name);
++        Ok(out)
++    }
++    pub fn from_descriptor(data: &[u8]) -> io::Result<Self> {
++        if data.len() > 56 + 510 {
++            return Err(invalid());
++        }
++        let mut c = Cursor(data);
++        let kind = c.u32()?;
++        let storage = c.u32()?;
++        let offset = c.u64()?;
++        let size = c.u64()?;
++        let digest = c.bytes()?;
++        let location = match storage {
++            0 => PayloadLocation::Archive(offset),
++            1 => PayloadLocation::Payload(offset),
++            _ => return Err(invalid()),
++        };
++        Ok(Self {
++            kind,
++            name: c.0.to_vec(),
++            size,
++            digest,
++            location,
++        })
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 8c62127..0980202 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -33,6 +33,9 @@ pub struct Metadata {
+     /// Data typically found in a `stat()` call.
+     pub stat: Stat,
+ 
++    /// Native platform metadata in the experimental native PXAR format.
++    pub native: Option<format::native::NativeMetadata>,
++
+     /// Extended attributes.
+     pub xattrs: Vec<format::XAttr>,
+ 
+@@ -169,6 +172,7 @@ impl MetadataBuilder {
+                     gid: 0,
+                     mtime: format::StatxTimestamp::zero(),
+                 },
++                native: None,
+                 xattrs: Vec::new(),
+                 acl: Acl {
+                     users: Vec::new(),

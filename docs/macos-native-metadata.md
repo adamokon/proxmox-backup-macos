@@ -6,29 +6,22 @@ Linux helper. FUSE mount/map commands remain Linux-only.
 
 ## Representation
 
-Each normal PXAR entry carries a versioned `user.proxmox.macos.v1` envelope in
-ordinary PXAR extended attribute records. Its checked JSON payload is split into
-60 KiB records, bounded to 4 MiB and SHA-256 checked. It describes the birth time,
-ordered Darwin ACL entries using UUID principals, original BSD flags, and native
-attribute names and content references. Actual native attribute names cannot
-collide with the envelope: all native names are represented inside it.
+The `codex/native-pxar-metadata` branch uses experimental native PXAR records,
+following upstream's architectural feedback. Small descriptors stay in the
+metadata stream; attribute bytes and resource forks are streamed in the unified
+archive or the split `.ppxar` payload stream. The new writer does not emit
+synthetic xattrs, an auxiliary archive, or a metadata map. The old representation
+remains readable for backups written by the previously deployed prototype.
 
-Attribute bytes, including resource forks, are content-addressed files in one
-additional ordinary PXAR archive in the same PBS snapshot. This supports forks
-larger than the PXAR xattr record size while keeping the existing wire format.
-`macos-metadata.json.blob` associates primary archives with the auxiliary archive
-and bounds its file count and total bytes. Its manifest entry is protected using
-the selected PBS crypt mode. The names of additional archives are chosen to avoid
-user archive names. Linux can inspect/download these standard archives; applying
-Darwin metadata requires this native client.
+See [the wire-format draft](native-pxar-draft.md) for the unallocated experimental
+identifiers, Darwin and Windows representation, compatibility, integrity checks,
+and upstream review boundaries. The root-owned deployed client continues using
+the earlier format until an explicitly reviewed upgrade.
 
-A local temporary spool uses authenticated AES-256-GCM with an ephemeral random
-process-local key, unique nonces, and a plaintext SHA-256 content index. Spool
-ciphertext and keys are never uploaded. The client authenticates and streams
-plaintext into the normal PBS pipeline, preserving deterministic content for
-deduplication. Restoring the auxiliary archive uses the same encrypted spool.
-The spool is explicitly excluded if it falls beneath a selected backup root.
-Its required free space is approximately the unique native attribute data size.
+Local temporary payload storage uses authenticated AES-256-GCM with an ephemeral
+process-local key and unique nonces. No plaintext temporary files are created;
+spool ciphertext and keys are not uploaded. Ordinary PBS encryption/deduplication
+processes the archive streams. Spools are excluded from their own backup roots.
 
 ## Filesystem behavior
 
@@ -60,7 +53,7 @@ encryption keys should stay outside the source repository and backup scripts.
 
 ## Upstream review
 
-The envelope/auxiliary archive design is a proposal requiring Proxmox review.
+The native PXAR format is an experimental proposal requiring Proxmox review.
 There is no claim of official macOS support. Proxmox requests development patches
 on `pbs-devel`, with a valid contributor agreement before inclusion:
 https://pbs.proxmox.com/wiki/Developer_Documentation

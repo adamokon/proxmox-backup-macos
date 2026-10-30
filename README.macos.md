@@ -37,14 +37,21 @@ plus destination filename collision rejection before truncation.
 PBS integration tests passed using a dedicated test datastore namespace and
 restricted API token: two backups and restore without encryption, then two
 backups and restore with client-side encryption. The repeated backup reused
-100% of both primary data and native attribute archive chunks, uploading 0 B
-for those archive data streams. These tests use synthetic files, not production
+100% of archive data chunks. The native PXAR draft also passed encrypted PBS
+backup/restore for unified and split streams and legacy-prototype restoration. These tests use synthetic files, not production
 backup data. Linux format and compilation regressions are checked separately.
 
-[Native metadata design and limits](docs/macos-native-metadata.md) describes the
-versioned envelope and additional standard PXAR archive. The server and PXAR
-wire formats are unchanged. The native client restores the associated metadata
-automatically with the ordinary `restore` command. FUSE mount/map remain Linux-only.
+This branch implements the native PXAR redesign requested during upstream review.
+[Native metadata design and limits](docs/macos-native-metadata.md) and the
+[experimental wire draft](docs/native-pxar-draft.md) describe typed Darwin/Windows
+metadata and native payload records in unified and split archives. Large payloads
+live in `.ppxar`; the tested `.mpxar` was 1779 bytes for roughly 5 MiB of data.
+The PBS transport remains unchanged; PXAR uses a deliberately experimental,
+unallocated format version requiring upstream review. The new reader also restores
+the earlier prototype's backups. New backups do not use an envelope/auxiliary
+archive. Existing Homebrew installations and scheduled backups keep their earlier
+format until an explicitly reviewed upgrade. FUSE mount/map remain Linux-only.
+Windows is tested as a synthetic wire representation, not a native client.
 Intel and older macOS versions have not been verified.
 
 ## Build and use
