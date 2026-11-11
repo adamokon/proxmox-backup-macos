@@ -6,6 +6,21 @@ use pbs_tools::crypt_config::CryptConfig;
 
 use super::{check_previous_manifest, previous_reference_archives};
 
+#[test]
+fn status_percentage_handles_restricted_and_malformed_values() -> Result<(), Error> {
+    use super::render_total_with_optional_percentage as render;
+    use serde_json::json;
+
+    assert_eq!(render(&json!(0), &json!({"total": 0}))?, "0");
+    assert_eq!(render(&json!(17), &json!({"total": 0}))?, "17");
+    assert!(render(&json!(50), &json!({"total": 100}))?.ends_with(" (50 %)"));
+    assert!(render(&json!(u64::MAX), &json!({"total": u64::MAX}))?.ends_with(" (100 %)"));
+    assert!(render(&json!(null), &json!({"total": 100})).is_err());
+    assert!(render(&json!(1), &json!({})).is_err());
+    assert!(render(&json!(-1), &json!({"total": 100})).is_err());
+    Ok(())
+}
+
 fn manifest(crypt_mode: CryptMode, key: &CryptConfig) -> Result<BackupManifest, Error> {
     let mut manifest = BackupManifest::new("host/test/2026-06-11T09:16:31Z".parse()?);
     manifest.add_file(&"test.mpxar.didx".try_into()?, 200, [1; 32], crypt_mode)?;

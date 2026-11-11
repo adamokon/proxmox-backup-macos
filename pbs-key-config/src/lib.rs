@@ -14,6 +14,11 @@ use pbs_api_types::{Fingerprint, Kdf, KeyInfo};
 
 use pbs_tools::crypt_config::CryptConfig;
 
+const EXPECTED_KEY_LEN: usize = 32;
+const KEY_IV_LEN: usize = 16;
+const KEY_TAG_LEN: usize = 16;
+const KEY_HEADER_LEN: usize = KEY_IV_LEN + KEY_TAG_LEN;
+
 /// Key derivation function configuration
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub enum KeyDerivationConfig {
@@ -125,10 +130,6 @@ impl KeyConfig {
 
     /// Creates a new instance, protect raw_key with passphrase.
     pub fn with_key(raw_key: &[u8; 32], passphrase: &[u8], kdf: Kdf) -> Result<Self, Error> {
-        if raw_key.len() != 32 {
-            bail!("got strange key length ({} != 32)", raw_key.len())
-        }
-
         let salt = proxmox_sys::linux::random_data(32)?;
 
         let kdf = match kdf {
@@ -148,8 +149,8 @@ impl KeyConfig {
 
         let cipher = openssl::symm::Cipher::aes_256_gcm();
 
-        let iv = proxmox_sys::linux::random_data(16)?;
-        let mut tag = [0u8; 16];
+        let iv = proxmox_sys::linux::random_data(KEY_IV_LEN)?;
+        let mut tag = [0u8; KEY_TAG_LEN];
 
         let encrypted_key =
             openssl::symm::encrypt_aead(cipher, &derived_key, Some(&iv), b"", raw_key, &mut tag)?;
@@ -179,6 +180,15 @@ impl KeyConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<KeyConfig, Error> {
         let keydata = file_get_contents(path)?;
         let key_config: KeyConfig = serde_json::from_reader(&keydata[..])?;
+        if key_config.kdf.is_none() && key_config.data.len() != EXPECTED_KEY_LEN {
+            bail!(
+                "unexpected key length ({} != {EXPECTED_KEY_LEN})",
+                key_config.data.len()
+            );
+        }
+        if key_config.kdf.is_some() && key_config.data.len() <= KEY_HEADER_LEN {
+            bail!("Unable to decrypt key - short data");
+        }
         Ok(key_config)
     }
 
@@ -190,6 +200,9 @@ impl KeyConfig {
         let raw_data = &self.data;
 
         let key = if let Some(ref kdf) = self.kdf {
+            if raw_data.len() <= KEY_HEADER_LEN {
+                bail!("Unable to decrypt key - short data");
+            }
             let passphrase = passphrase()?;
             if passphrase.len() < 5 {
                 bail!("Passphrase is too short!");
@@ -197,12 +210,9 @@ impl KeyConfig {
 
             let derived_key = kdf.derive_key(&passphrase)?;
 
-            if raw_data.len() < 32 {
-                bail!("Unable to decrypt key - short data");
-            }
-            let iv = &raw_data[0..16];
-            let tag = &raw_data[16..32];
-            let enc_data = &raw_data[32..];
+            let iv = &raw_data[..KEY_IV_LEN];
+            let tag = &raw_data[KEY_IV_LEN..KEY_HEADER_LEN];
+            let enc_data = &raw_data[KEY_HEADER_LEN..];
 
             let cipher = openssl::symm::Cipher::aes_256_gcm();
 
@@ -219,8 +229,12 @@ impl KeyConfig {
             raw_data.clone()
         };
 
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&key);
+        let result: [u8; EXPECTED_KEY_LEN] = key.as_slice().try_into().map_err(|_| {
+            format_err!(
+                "unexpected key length {} (expected {EXPECTED_KEY_LEN})",
+                key.len()
+            )
+        })?;
 
         let crypt_config = CryptConfig::new(result)?;
         let fingerprint = Fingerprint::new(crypt_config.fingerprint());
@@ -379,6 +393,57 @@ fn encrypt_decrypt_test() -> Result<(), Error> {
     assert_eq!(key.data, decrypted);
     assert_eq!(key.fingerprint, Some(fingerprint));
 
+    Ok(())
+}
+
+#[test]
+fn plain_key_length_check() -> Result<(), Error> {
+    let mut config = KeyConfig::without_password([0x11; EXPECTED_KEY_LEN])?;
+    for length in [0, 1, 15, 16, 31, 32, 33, 64] {
+        config.data = vec![0x11; length];
+        let encoded = serde_json::to_vec(&config)?;
+        let result = decrypt_key(&encoded, &|| {
+            panic!("plain keys must not request a password")
+        });
+        assert_eq!(
+            result.is_ok(),
+            length == EXPECTED_KEY_LEN,
+            "length {length}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_key_requires_ciphertext() -> Result<(), Error> {
+    let mut config = KeyConfig::without_password([0x11; EXPECTED_KEY_LEN])?;
+    config.kdf = Some(KeyDerivationConfig::PBKDF2 {
+        iter: 1,
+        salt: vec![0x22; 16],
+    });
+    for length in [0, 15, 16, 31, KEY_HEADER_LEN] {
+        config.data = vec![0; length];
+        assert!(
+            config
+                .decrypt(&|| panic!("invalid framing must fail before password lookup"))
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn password_protected_key_roundtrip() -> Result<(), Error> {
+    let expected = [0x33; EXPECTED_KEY_LEN];
+    let config = KeyConfig::with_key(&expected, b"test-passphrase", Kdf::PBKDF2)?;
+    assert_eq!(config.data.len(), KEY_HEADER_LEN + EXPECTED_KEY_LEN);
+    let (actual, _, _) = config.decrypt(&|| Ok(b"test-passphrase".to_vec()))?;
+    assert_eq!(actual, expected);
+    assert!(
+        config
+            .decrypt(&|| Ok(b"wrong-passphrase".to_vec()))
+            .is_err()
+    );
     Ok(())
 }
 

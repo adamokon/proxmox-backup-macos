@@ -1604,7 +1604,7 @@ fn lookup_dynamic_entries(
         };
         indices.push(reusable_dynamic_entry);
 
-        if range.end < end {
+        if range.end <= end {
             padding_end = end - range.end;
             break;
         }
@@ -2308,6 +2308,33 @@ mod tests {
         let mut last = None;
         assert!(super::try_record_strictly_greater(&mut last, 0));
         assert_eq!(last, Some(0));
+    }
+
+    #[test]
+    fn lookup_dynamic_entries_range_end_check() {
+        use pbs_datastore::dynamic_index::DynamicIndexWriter;
+
+        let testdir = create_testdir("lookup_dynamic_entries_range_end_check").unwrap();
+        let path = testdir.join("lookup_dynamic_entries.didx");
+        let mut writer = DynamicIndexWriter::create(&path).unwrap();
+        writer.add_chunk(1024, &[0xAA; 32]).unwrap();
+        writer.add_chunk(2048, &[0xBB; 32]).unwrap();
+        writer.add_chunk(3072, &[0xCC; 32]).unwrap();
+        writer.close().unwrap();
+        let reader = DynamicIndexReader::open(&path).unwrap();
+        for (range, count, start_padding, end_padding) in [
+            (0..1024, 1, 0, 0),
+            (16..1024, 1, 16, 0),
+            (0..1000, 1, 0, 24),
+            (1024..2048, 1, 0, 0),
+            (0..2048, 2, 0, 0),
+            (0..2049, 3, 0, 1023),
+        ] {
+            let (indices, start, end) = super::lookup_dynamic_entries(&reader, &range).unwrap();
+            assert_eq!(indices.len(), count, "chunk count for {range:?}");
+            assert_eq!(start, start_padding, "start padding for {range:?}");
+            assert_eq!(end, end_padding, "end padding for {range:?}");
+        }
     }
 
     /// Pins `lookup_dynamic_entries`'s `end_offset` population to `dynamic_entry.end()`;
