@@ -5,11 +5,11 @@
   "upstream_base": "78f77d53718b351bebacfa4f56f85134616e0b02",
   "archives": [
     {
-      "name": "proxmox-backup-macos-port-2045c0f309-20261111.bundle",
+      "name": "proxmox-backup-macos-port-6cbdb19b6c-20261111.bundle",
       "source_url": "https://git.proxmox.com/git/proxmox-backup.git",
-      "head_commit": "2045c0f309c20e644836a7e3225a670f564ff4da",
-      "size": 19012303,
-      "sha256": "8b30828784dd29e90156686966923a87bc5cffc2a6bb147a7bfd398f2ba321c1",
+      "head_commit": "6cbdb19b6c2d735c884a7dd33560cc836d4128aa",
+      "size": 19013176,
+      "sha256": "7bf38f9ac324b1c707d193181fefd61546e52d248328ac25b980ffaa15f4252f",
       "complete_git_history": true
     },
     {
@@ -48,10 +48,10 @@
   "registry_dependencies_included": false,
   "rust_toolchain_included": false,
   "native_libraries_included": false,
-  "supersedes_manifest": "macos-client-source-history-2aa4ff1cb1-20261111.json",
-  "canonical_port_commit": "2045c0f309c20e644836a7e3225a670f564ff4da",
+  "supersedes_manifest": "macos-client-source-history-2045c0f309-20261111.json",
+  "canonical_port_commit": "6cbdb19b6c2d735c884a7dd33560cc836d4128aa",
   "upstream_tree": "e220b7c7f2e59275765e4744063a02ce1e0b89ad",
   "github_baseline_commit": "2ceebaaae1ddb955fa6e4f2cbc40ee3517511c07",
-  "projection_tree_before_provenance": "b082afa47b62f0f068d393f44f6f2382884f96d6",
-  "history_manifest": "macos-client-source-history-2045c0f309-20261111.json"
+  "projection_tree_before_provenance": "df1a88c83d5600a42db659a0f86c7422d493cfc3",
+  "history_manifest": "macos-client-source-history-6cbdb19b6c-20261111.json"
 }
