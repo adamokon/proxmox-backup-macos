@@ -33,6 +33,12 @@ jobs:
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package endian_trait
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pathpatterns
           cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-sys maps_4096_byte_header_on_native_page_size
+      - name: Test upstream key, PXAR range and CLI status regressions
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-key-config
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-client --lib lookup_dynamic_entries_range_end_check
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client --bin proxmox-backup-client status_percentage_handles_restricted_and_malformed_values
       - name: Test native PXAR wire format and old-format compatibility
         working-directory: ${{ runner.temp }}
         run: |
@@ -41,3 +47,8 @@ jobs:
       - name: Check Linux client compilation
         working-directory: ${{ runner.temp }}
         run: cargo check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client
+      - name: Check declared minimum Rust version
+        working-directory: ${{ runner.temp }}
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          cargo +1.91.0 check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client

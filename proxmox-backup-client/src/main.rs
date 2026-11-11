@@ -2169,29 +2169,34 @@ async fn status(param: Value) -> Result<Value, Error> {
 
     record_repository(&repo);
 
-    let render_total_percentage = |v: &Value, record: &Value| -> Result<String, Error> {
-        let v = v.as_u64().unwrap();
-        let total = record["total"].as_u64().unwrap();
-        let roundup = total / 200;
-        if let Some(per) = ((v + roundup) * 100).checked_div(total) {
-            let info = format!(" ({per} %)");
-            Ok(format!("{v} {info:>8}"))
-        } else {
-            bail!("Cannot render total percentage: denominator is zero");
-        }
-    };
-
     let options = default_table_format_options()
         .noheader(true)
-        .column(ColumnConfig::new("total").renderer(render_total_percentage))
-        .column(ColumnConfig::new("used").renderer(render_total_percentage))
-        .column(ColumnConfig::new("avail").renderer(render_total_percentage));
+        .column(ColumnConfig::new("total").renderer(render_total_with_optional_percentage))
+        .column(ColumnConfig::new("used").renderer(render_total_with_optional_percentage))
+        .column(ColumnConfig::new("avail").renderer(render_total_with_optional_percentage));
 
     let return_type = &API_METHOD_STATUS.returns;
 
     format_and_print_result_full(&mut data, return_type, &output_format, &options);
 
     Ok(Value::Null)
+}
+
+fn render_total_with_optional_percentage(v: &Value, record: &Value) -> Result<String, Error> {
+    let value = v
+        .as_u64()
+        .ok_or_else(|| format_err!("value is not a number"))?;
+    let total = record["total"]
+        .as_u64()
+        .ok_or_else(|| format_err!("total is not a number"))?;
+    let numerator = (u128::from(value) + u128::from(total / 200)) * 100;
+    match numerator.checked_div(u128::from(total)) {
+        Some(percentage) => {
+            let info = format!(" ({percentage} %)");
+            Ok(format!("{value} {info:>8}"))
+        }
+        None => Ok(value.to_string()),
+    }
 }
 
 /// This is a workaround until we have cleaned up the chunk/reader/... infrastructure for better
