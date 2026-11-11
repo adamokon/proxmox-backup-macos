@@ -1,5 +1,5 @@
-//! Versioned native metadata carried by ordinary PXAR xattrs and payload files.
-//! Server protocols and the PXAR wire format remain unchanged.
+//! Native PXAR metadata and encrypted streaming payload storage.
+//! The old xattr/auxiliary-archive representation is retained for restore only.
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -63,10 +63,10 @@ struct EncryptedPayload {
 /// bytes, key and nonce are never uploaded. PXAR receives authenticated plaintext
 /// streams, then normal PBS encryption/deduplication applies as selected by CLI.
 pub struct NativePayloads {
-    directory: tempfile::TempDir,
+    directory: Arc<tempfile::TempDir>,
     directory_fd: File,
     key: [u8; 32],
-    records: Mutex<BTreeMap<String, EncryptedPayload>>,
+    records: Arc<Mutex<BTreeMap<String, EncryptedPayload>>>,
 }
 
 impl NativePayloads {
@@ -76,10 +76,10 @@ impl NativePayloads {
         let directory = tempfile::tempdir()?;
         let directory_fd = File::open(directory.path())?;
         Ok(Arc::new(Self {
-            directory,
+            directory: Arc::new(directory),
             directory_fd,
             key,
-            records: Mutex::new(BTreeMap::new()),
+            records: Arc::new(Mutex::new(BTreeMap::new())),
         }))
     }
     pub fn is_empty(&self) -> bool {
@@ -159,6 +159,114 @@ impl NativePayloads {
         encoder.close()?;
         writer.flush()?;
         Ok(())
+    }
+}
+
+/// Streaming decoder destination. No plaintext payload is written to disk and
+/// nothing becomes visible to metadata restoration before digest/length checks.
+struct NativeSink {
+    directory: Arc<tempfile::TempDir>,
+    records: Arc<Mutex<BTreeMap<String, EncryptedPayload>>>,
+    file: tempfile::NamedTempFile,
+    cipher: Crypter,
+    nonce: [u8; 12],
+    hash: Sha256,
+    expected: [u8; 32],
+    length: u64,
+    written: u64,
+}
+impl Write for NativeSink {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let new_length = self
+            .written
+            .checked_add(input.len() as u64)
+            .filter(|n| *n <= self.length)
+            .ok_or_else(|| io::Error::other("native payload exceeded declared size"))?;
+        let mut encrypted = vec![0; input.len() + 16];
+        let count = self
+            .cipher
+            .update(input, &mut encrypted)
+            .map_err(io::Error::other)?;
+        self.file.write_all(&encrypted[..count])?;
+        self.hash.update(input);
+        self.written = new_length;
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+impl pxar::format::native::PayloadWriter for NativeSink {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let mut this = *self;
+        if this.written != this.length || this.hash.finish() != this.expected {
+            return Err(io::Error::other("native payload length/digest mismatch"));
+        }
+        let mut tail = [0; 16];
+        let count = this.cipher.finalize(&mut tail).map_err(io::Error::other)?;
+        this.file.write_all(&tail[..count])?;
+        let mut tag = [0; 16];
+        this.cipher.get_tag(&mut tag).map_err(io::Error::other)?;
+        let key = hex::encode(this.expected);
+        let mut records = this.records.lock().unwrap();
+        if let Some(record) = records.get(&key) {
+            if record.length != this.length {
+                return Err(io::Error::other("native digest collision"));
+            }
+        } else {
+            this.file
+                .persist_noclobber(this.directory.path().join(&key))
+                .map_err(io::Error::other)?;
+            records.insert(
+                key,
+                EncryptedPayload {
+                    length: this.length,
+                    nonce: this.nonce,
+                    tag,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+impl pxar::format::native::PayloadStore for NativePayloads {
+    fn reader(&self, digest: [u8; 32], size: u64) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(
+            NativePayloads::reader(
+                self,
+                &Payload {
+                    key: hex::encode(digest),
+                    length: size,
+                },
+            )
+            .map_err(io::Error::other)?,
+        ))
+    }
+    fn writer(
+        &self,
+        digest: [u8; 32],
+        size: u64,
+    ) -> io::Result<Box<dyn pxar::format::native::PayloadWriter>> {
+        let mut nonce = [0; 12];
+        openssl::rand::rand_bytes(&mut nonce).map_err(io::Error::other)?;
+        let cipher = Crypter::new(
+            Cipher::aes_256_gcm(),
+            Mode::Encrypt,
+            &self.key,
+            Some(&nonce),
+        )
+        .map_err(io::Error::other)?;
+        Ok(Box::new(NativeSink {
+            directory: self.directory.clone(),
+            records: self.records.clone(),
+            file: tempfile::NamedTempFile::new_in(self.directory.path())?,
+            cipher,
+            nonce,
+            hash: Sha256::new(),
+            expected: digest,
+            length: size,
+            written: 0,
+        }))
     }
 }
 
@@ -347,17 +455,8 @@ pub fn capture(
     if (before.st_ctime, before.st_ctime_nsec) != (after.st_ctime, after.st_ctime_nsec) {
         bail!("source metadata changed during capture");
     }
-    let data = serde_json::to_vec(&native)?;
-    if data.len() > MAX_HEADER {
-        bail!("native metadata header exceeds limit");
-    }
-    let envelope = Envelope {
-        version: 1,
-        bytes: data.len(),
-        parts: data.len().div_ceil(PART),
-        sha256: hex::encode(sha256(&data)),
-    };
-    let mut result = pxar::Metadata {
+    let wire = native.to_pxar()?;
+    let result = pxar::Metadata {
         stat: pxar::Stat {
             mode: stat.st_mode as u64,
             flags: 0,
@@ -365,22 +464,59 @@ pub fn capture(
             gid: stat.st_gid,
             mtime: pxar::format::StatxTimestamp::new(stat.st_mtime, stat.st_mtime_nsec as u32),
         },
+        native: Some(wire),
         ..Default::default()
     };
-    result.xattrs.push(pxar::format::XAttr::new(
-        PREFIX.as_bytes(),
-        serde_json::to_vec(&envelope)?,
-    ));
-    for (index, part) in data.chunks(PART).enumerate() {
-        result.xattrs.push(pxar::format::XAttr::new(
-            format!("{PREFIX}.{index:08x}").as_bytes(),
-            part.to_vec(),
-        ));
-    }
     Ok(result)
 }
 
 pub fn decode(metadata: &pxar::Metadata) -> Result<Option<NativeMetadata>, Error> {
+    if let Some(native) = &metadata.native {
+        use pxar::format::native::{PayloadLocation, PlatformMetadata};
+        native.validate()?;
+        let PlatformMetadata::Darwin(m) = &native.platform else {
+            bail!("Windows native metadata requires an explicit restoration policy on macOS");
+        };
+        let mut attributes = Vec::new();
+        for a in &native.attributes {
+            if a.location != PayloadLocation::Source {
+                bail!("native payload has not been materialized");
+            }
+            attributes.push(Attribute {
+                name: a.name.clone(),
+                payload: Payload {
+                    key: hex::encode(a.digest),
+                    length: a.size,
+                },
+            });
+        }
+        return Ok(Some(NativeMetadata {
+            version: 1,
+            birthtime: BirthTime {
+                seconds: m.birth_seconds,
+                nanoseconds: m.birth_nanoseconds as i64,
+            },
+            acl: m.acl.as_ref().map(|(flags, entries)| Acl {
+                flags: *flags,
+                entries: entries
+                    .iter()
+                    .map(|e| super::darwin_metadata::Ace {
+                        principal_uuid: e.principal,
+                        kind: e.kind,
+                        flags: e.flags,
+                        permissions: e.permissions,
+                    })
+                    .collect(),
+            }),
+            flags: m.flags,
+            attributes,
+        }));
+    }
+    decode_legacy(metadata)
+}
+
+/// Interpret legacy reserved xattrs only when the snapshot map opts into this representation.
+fn decode_legacy(metadata: &pxar::Metadata) -> Result<Option<NativeMetadata>, Error> {
     let controls: Vec<_> = metadata
         .xattrs
         .iter()
@@ -447,8 +583,28 @@ fn validate_payload(value: &Payload) -> Result<(), Error> {
     Ok(())
 }
 
+thread_local! { static LEGACY_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(crate) fn legacy_restore_enabled() -> bool {
+    LEGACY_RESTORE.with(|s| s.get())
+}
+
 thread_local! { static RESTORE: RefCell<Option<Arc<NativePayloads>>> = const { RefCell::new(None) }; }
 pub fn with_restore_payloads<T>(
+    directory: Option<Arc<NativePayloads>>,
+    action: impl FnOnce() -> T,
+) -> T {
+    let old = LEGACY_RESTORE.with(|s| s.replace(directory.is_some()));
+    struct LegacyReset(bool);
+    impl Drop for LegacyReset {
+        fn drop(&mut self) {
+            LEGACY_RESTORE.with(|s| s.set(self.0));
+        }
+    }
+    let _legacy_reset = LegacyReset(old);
+    with_native_store(directory, action)
+}
+
+pub(crate) fn with_native_store<T>(
     directory: Option<Arc<NativePayloads>>,
     action: impl FnOnce() -> T,
 ) -> T {
@@ -463,8 +619,25 @@ pub fn with_restore_payloads<T>(
     action()
 }
 
-pub(crate) fn restoring_native_metadata() -> bool {
-    RESTORE.with(|slot| slot.borrow().is_some())
+pub(crate) fn restore_store() -> Option<Arc<NativePayloads>> {
+    RESTORE.with(|slot| slot.borrow().clone())
+}
+
+/// A thread-bound scope used only around synchronous metadata application,
+/// never across an await point. Extractors own the store across async suspension.
+pub(crate) struct NativeStoreGuard(
+    Option<Arc<NativePayloads>>,
+    std::marker::PhantomData<std::rc::Rc<()>>,
+);
+impl NativeStoreGuard {
+    pub fn enter(store: Option<Arc<NativePayloads>>) -> Self {
+        Self(RESTORE.with(|s| s.replace(store)), std::marker::PhantomData)
+    }
+}
+impl Drop for NativeStoreGuard {
+    fn drop(&mut self) {
+        RESTORE.with(|s| *s.borrow_mut() = self.0.take());
+    }
 }
 
 fn payload_file(value: &Payload) -> Result<DecryptedPayload, Error> {
@@ -475,6 +648,49 @@ fn payload_file(value: &Payload) -> Result<DecryptedPayload, Error> {
 }
 
 impl NativeMetadata {
+    fn to_pxar(&self) -> Result<pxar::format::native::NativeMetadata, Error> {
+        use pxar::format::native::*;
+        let native = pxar::format::native::NativeMetadata {
+            platform: PlatformMetadata::Darwin(DarwinMetadata {
+                birth_seconds: self.birthtime.seconds,
+                birth_nanoseconds: self.birthtime.nanoseconds.try_into()?,
+                flags: self.flags,
+                acl: self.acl.as_ref().map(|a| {
+                    (
+                        a.flags,
+                        a.entries
+                            .iter()
+                            .map(|e| DarwinAce {
+                                principal: e.principal_uuid,
+                                kind: e.kind,
+                                flags: e.flags,
+                                permissions: e.permissions,
+                            })
+                            .collect(),
+                    )
+                }),
+            }),
+            attributes: self
+                .attributes
+                .iter()
+                .map(|a| {
+                    let digest: [u8; 32] = hex::decode(&a.payload.key)?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid native digest"))?;
+                    Ok(NativeAttribute {
+                        kind: DARWIN_XATTR,
+                        name: a.name.clone(),
+                        size: a.payload.length,
+                        digest,
+                        location: PayloadLocation::Source,
+                    })
+                })
+                .collect::<Result<_, Error>>()?,
+        };
+        native.validate()?;
+        Ok(native)
+    }
+
     pub fn restore_attributes(&self, fd: RawFd, flags: Flags) -> Result<(), Error> {
         if !flags.contains(Flags::WITH_XATTRS) {
             return Ok(());

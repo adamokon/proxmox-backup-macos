@@ -69,6 +69,20 @@ where
     T: pxar::decoder::SeqRead,
     F: FnMut(&Path),
 {
+    #[cfg(target_os = "macos")]
+    {
+        let store = super::darwin_archive::restore_store()
+            .map_or_else(super::darwin_archive::NativePayloads::new, Ok)?;
+        let mut decoder = decoder;
+        decoder.set_native_payload_store(store.clone());
+        return super::darwin_archive::with_native_store(Some(store), || {
+            ExtractorIter::new(decoder, destination, feature_flags, callback, options)
+                .context("failed to initialize extractor")?
+                .collect::<Result<(), Error>>()
+                .context("encountered unexpected error during extraction")
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
     ExtractorIter::new(decoder, destination, feature_flags, callback, options)
         .context("failed to initialize extractor")?
         .collect::<Result<(), Error>>()
@@ -482,6 +496,8 @@ impl std::fmt::Display for PxarExtractContext {
 
 /// Common state for file extraction.
 pub struct Extractor {
+    #[cfg(target_os = "macos")]
+    native_store: Option<Arc<super::darwin_archive::NativePayloads>>,
     feature_flags: Flags,
     allow_existing_dirs: bool,
     overwrite_flags: OverwriteFlags,
@@ -505,6 +521,8 @@ impl Extractor {
         feature_flags: Flags,
     ) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
+            native_store: super::darwin_archive::restore_store(),
             dir_stack: PxarDirStack::new(root_dir, metadata),
             allow_existing_dirs,
             overwrite_flags,
@@ -567,6 +585,9 @@ impl Extractor {
             .context("broken pxar archive (directory stack underrun)")?;
 
         if let Some(fd) = dir.try_as_borrowed_fd() {
+            #[cfg(target_os = "macos")]
+            let _native_scope =
+                super::darwin_archive::NativeStoreGuard::enter(self.native_store.clone());
             metadata::apply(
                 self.feature_flags,
                 dir.metadata(),
@@ -614,6 +635,9 @@ impl Extractor {
             Err(err) => return Err(err.into()),
         }
 
+        #[cfg(target_os = "macos")]
+        let _native_scope =
+            super::darwin_archive::NativeStoreGuard::enter(self.native_store.clone());
         metadata::apply_at(
             self.feature_flags,
             metadata,
@@ -719,6 +743,9 @@ impl Extractor {
         unsafe { c_result!(libc::mknodat(parent, file_name.as_ptr(), mode, device)) }
             .context("failed to create device node")?;
 
+        #[cfg(target_os = "macos")]
+        let _native_scope =
+            super::darwin_archive::NativeStoreGuard::enter(self.native_store.clone());
         metadata::apply_at(
             self.feature_flags,
             metadata,
@@ -785,6 +812,9 @@ impl Extractor {
             } {}
         }
 
+        #[cfg(target_os = "macos")]
+        let _native_scope =
+            super::darwin_archive::NativeStoreGuard::enter(self.native_store.clone());
         metadata::apply(
             self.feature_flags,
             metadata,
@@ -854,6 +884,9 @@ impl Extractor {
             } {}
         }
 
+        #[cfg(target_os = "macos")]
+        let _native_scope =
+            super::darwin_archive::NativeStoreGuard::enter(self.native_store.clone());
         metadata::apply(
             self.feature_flags,
             metadata,
@@ -1203,10 +1236,20 @@ where
 {
     let root = decoder.open_root().await?;
 
-    let mut extractor = get_extractor(
-        destination,
-        root.lookup_self().await?.entry().metadata().clone(),
-    )?;
+    let mut root_entry = root.lookup_self().await?;
+    #[cfg(target_os = "macos")]
+    let store = {
+        let store = super::darwin_archive::NativePayloads::new()?;
+        root_entry
+            .materialize_native_metadata(store.clone())
+            .await?;
+        store
+    };
+    let mut extractor = get_extractor(destination, root_entry.entry().metadata().clone())?;
+    #[cfg(target_os = "macos")]
+    {
+        extractor.native_store = Some(store);
+    }
 
     let file = root
         .lookup(&path)
@@ -1224,18 +1267,29 @@ where
     S: pxar::decoder::SeqRead + Unpin + Send + 'static,
     DEST: AsRef<Path>,
 {
+    #[cfg(target_os = "macos")]
+    let store = super::darwin_archive::NativePayloads::new()?;
+    #[cfg(target_os = "macos")]
+    decoder.set_native_payload_store(store.clone());
     decoder.enable_goodbye_entries(true);
-    let root = match decoder.next().await {
-        Some(Ok(root)) => root,
-        Some(Err(err)) => return Err(err).context("error getting root entry from pxar"),
-        None => bail!("cannot extract empty archive"),
+    let root = loop {
+        match decoder.next().await {
+            Some(Ok(root)) => match root.kind() {
+                EntryKind::Version(_) | EntryKind::Prelude(_) => continue,
+                _ => break root,
+            },
+            Some(Err(err)) => return Err(err).context("error getting root entry from pxar"),
+            None => bail!("cannot extract empty archive"),
+        }
     };
 
     let mut extractor = get_extractor(destination, root.metadata().clone())?;
-
-    if let Err(err) = seq_files_extractor(&mut extractor, decoder).await {
-        error!("error extracting pxar archive: {}", err);
+    #[cfg(target_os = "macos")]
+    {
+        extractor.native_store = Some(store);
     }
+
+    seq_files_extractor(&mut extractor, decoder).await?;
 
     Ok(())
 }
@@ -1289,11 +1343,15 @@ fn get_filename(entry: &Entry) -> Result<(OsString, CString), Error> {
 
 async fn recurse_files_extractor<T>(
     extractor: &mut Extractor,
-    file: FileEntry<T>,
+    mut file: FileEntry<T>,
 ) -> Result<(), Error>
 where
     T: Clone + pxar::accessor::ReadAt + Unpin + Send + Sync + 'static,
 {
+    #[cfg(target_os = "macos")]
+    if let Some(store) = &extractor.native_store {
+        file.materialize_native_metadata(store.clone()).await?;
+    }
     let entry = file.entry();
     let metadata = entry.metadata();
     let (file_name_os, file_name) = get_filename(entry)?;
@@ -1339,6 +1397,10 @@ async fn seq_files_extractor<T>(
 where
     T: pxar::decoder::SeqRead,
 {
+    #[cfg(target_os = "macos")]
+    if let Some(store) = &extractor.native_store {
+        decoder.set_native_payload_store(store.clone());
+    }
     let mut dir_level = 0;
     loop {
         let entry = match decoder.next().await {
@@ -1390,7 +1452,7 @@ where
                 EntryKind::GoodbyeTable => "<directory>".to_string(),
                 _ => entry.path().display().to_string(),
             };
-            error!("error extracting {path_display}: {err}");
+            return Err(err).with_context(|| format!("error extracting {path_display}"));
         }
 
         if dir_level < 0 {

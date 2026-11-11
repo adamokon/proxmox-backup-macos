@@ -247,6 +247,14 @@ where
     T: SeqWrite + Send,
     F: FnMut(&Path) -> Result<(), Error> + Send + 'static,
 {
+    #[cfg(target_os = "macos")]
+    let options = {
+        let mut options = options;
+        if options.native_payloads.is_none() {
+            options.native_payloads = Some(super::darwin_archive::NativePayloads::new()?);
+        }
+        options
+    };
     let fs_magic = detect_fs_type(source_dir.as_raw_fd())?;
     if is_virtual_file_system(fs_magic) {
         bail!("refusing to backup a virtual file system");
@@ -304,6 +312,18 @@ where
             (None, None)
         };
 
+    #[cfg(target_os = "macos")]
+    let mut encoder = Encoder::new_with_native(
+        writers.archive,
+        &metadata,
+        prelude.as_deref(),
+        options
+            .native_payloads
+            .clone()
+            .context("native PXAR payload store required")?,
+    )
+    .await?;
+    #[cfg(not(target_os = "macos"))]
     let mut encoder = Encoder::new(writers.archive, &metadata, prelude.as_deref()).await?;
 
     let mut archiver = Archiver {
