@@ -1,0 +1,2 @@
+# A unified diff represents unchanged blank context lines with one space.
+scripts/macos/*.patch whitespace=-blank-at-eol,-blank-at-eof

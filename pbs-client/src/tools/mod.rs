@@ -796,21 +796,21 @@ pub fn has_pxar_filename_extension(name: &str, with_didx_extension: bool) -> boo
 
 /// Raise the soft limit for open file handles to the hard limit
 ///
-/// Returns the values set before raising the limit as libc::rlimit64
-pub fn raise_nofile_limit() -> Result<libc::rlimit64, Error> {
-    let mut old = libc::rlimit64 {
+/// Returns the values set before raising the limit as libc::rlimit
+pub fn raise_nofile_limit() -> Result<libc::rlimit, Error> {
+    let mut old = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    if 0 != unsafe { libc::getrlimit64(libc::RLIMIT_NOFILE, &mut old as *mut libc::rlimit64) } {
+    if 0 != unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old as *mut libc::rlimit) } {
         bail!("Failed to get nofile rlimit");
     }
 
-    let mut new = libc::rlimit64 {
+    let mut new = libc::rlimit {
         rlim_cur: old.rlim_max,
         rlim_max: old.rlim_max,
     };
-    if 0 != unsafe { libc::setrlimit64(libc::RLIMIT_NOFILE, &mut new as *mut libc::rlimit64) } {
+    if 0 != unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &mut new as *mut libc::rlimit) } {
         bail!("Failed to set nofile rlimit");
     }
 
@@ -819,6 +819,7 @@ pub fn raise_nofile_limit() -> Result<libc::rlimit64, Error> {
 
 /// Creates a temporary file (with `O_TMPFILE`) in `XDG_CACHE_HOME`. If we
 /// cannot create the file there it will be created in `/tmp` instead.
+#[cfg(not(target_os = "macos"))]
 pub fn create_tmp_file() -> std::io::Result<std::fs::File> {
     static TMP_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
     let tmp_path = TMP_PATH.get_or_init(|| {
@@ -839,6 +840,18 @@ pub fn create_tmp_file() -> std::io::Result<std::fs::File> {
             Err(err)
         }
     })
+}
+
+#[cfg(target_os = "macos")]
+pub fn create_tmp_file() -> std::io::Result<std::fs::File> {
+    if let Ok(base) = xdg::BaseDirectories::new() {
+        if let Ok(file) = tempfile::tempfile_in(base.get_cache_home()) {
+            return Ok(file);
+        }
+    }
+    // tempfile uses an exclusive create with close-on-exec and unlinks the
+    // name. Darwin does not implement Linux O_TMPFILE.
+    tempfile::tempfile()
 }
 
 #[cfg(test)]

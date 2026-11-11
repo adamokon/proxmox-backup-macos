@@ -15,7 +15,9 @@ pub mod pipe_to_stream;
 mod http_client;
 pub use http_client::*;
 
+#[cfg(target_os = "linux")]
 mod vsock_client;
+#[cfg(target_os = "linux")]
 pub use vsock_client::*;
 
 mod task_log;

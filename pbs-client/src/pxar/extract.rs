@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Error, bail, format_err};
 use bitflags::bitflags;
 use nix::dir::Dir;
-use nix::fcntl::{OFlag, OpenHow, ResolveFlag};
+use nix::fcntl::OFlag;
+#[cfg(not(target_os = "macos"))]
+use nix::fcntl::{OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
 
 use pathpatterns::{MatchEntry, MatchList, MatchType};
@@ -540,6 +542,11 @@ impl Extractor {
         metadata: Metadata,
         create: bool,
     ) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        {
+            let parent = self.parent_fd()?;
+            verify_native_name(parent, &CString::new(file_name.as_bytes())?)?;
+        }
         self.dir_stack.push(file_name, metadata)?;
 
         if create {
@@ -591,6 +598,8 @@ impl Extractor {
         link: &OsStr,
     ) -> Result<(), Error> {
         let parent = self.parent_fd()?;
+        #[cfg(target_os = "macos")]
+        verify_native_name(parent, file_name)?;
 
         match nix::unistd::symlinkat(link, Some(parent), file_name) {
             Ok(()) => {}
@@ -625,18 +634,29 @@ impl Extractor {
         let target_name = CString::new(target_name.as_bytes())?;
 
         let parent = self.parent_fd()?;
+        #[cfg(target_os = "macos")]
+        verify_native_name(parent, file_name)?;
         let root = self.dir_stack.root_dir_fd()?;
 
         // Only resolve the directory, linkat() without AT_EMPTY_PATH needs no CAP_DAC_READ_SEARCH
         // and does not follow the final component.
         let target_dir = match link.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => {
-                let how = OpenHow::new()
-                    .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
-                    .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
-                let fd = nix::fcntl::openat2(root.as_raw_fd(), dir, how)
+                #[cfg(not(target_os = "macos"))]
+                let fd = {
+                    let how = OpenHow::new()
+                        .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                        .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+                    let fd =
+                        nix::fcntl::openat2(root.as_raw_fd(), dir, how).with_context(|| {
+                            format!("failed to open hardlink target directory {dir:?}")
+                        })?;
+                    unsafe { OwnedFd::from_raw_fd(fd) }
+                };
+                #[cfg(target_os = "macos")]
+                let fd = super::darwin::open_directory_beneath(root.as_raw_fd(), dir)
                     .with_context(|| format!("failed to open hardlink target directory {dir:?}"))?;
-                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+                Some(fd)
             }
             _ => None,
         };
@@ -676,6 +696,10 @@ impl Extractor {
         metadata: &Metadata,
         device: &Device,
     ) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        if device.major > 255 || device.minor > 0x00ff_ffff {
+            bail!("device number exceeds Darwin range");
+        }
         self.extract_special(file_name, metadata, device.to_dev_t())
     }
 
@@ -686,10 +710,12 @@ impl Extractor {
         device: libc::dev_t,
     ) -> Result<(), Error> {
         let mode = metadata.stat.mode;
-        let mode = u32::try_from(mode).with_context(|| {
+        let mode = libc::mode_t::try_from(mode).with_context(|| {
             format!("device node's mode contains illegal bits: 0x{mode:x} (0o{mode:o})")
         })?;
         let parent = self.parent_fd()?;
+        #[cfg(target_os = "macos")]
+        verify_native_name(parent, file_name)?;
         unsafe { c_result!(libc::mknodat(parent, file_name.as_ptr(), mode, device)) }
             .context("failed to create device node")?;
 
@@ -712,6 +738,8 @@ impl Extractor {
         overwrite: bool,
     ) -> Result<(), Error> {
         let parent = self.parent_fd()?;
+        #[cfg(target_os = "macos")]
+        verify_native_name(parent, file_name)?;
         let mut oflags = OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_CLOEXEC;
         if overwrite {
             oflags |= OFlag::O_TRUNC | OFlag::O_NOFOLLOW;
@@ -778,6 +806,8 @@ impl Extractor {
         overwrite: bool,
     ) -> Result<(), Error> {
         let parent = self.parent_fd()?;
+        #[cfg(target_os = "macos")]
+        verify_native_name(parent, file_name)?;
         let mut oflags = OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_CLOEXEC;
         if overwrite {
             oflags |= OFlag::O_TRUNC | OFlag::O_NOFOLLOW;
@@ -1369,4 +1399,30 @@ where
             return Ok(());
         }
     }
+}
+
+/// Detect case/normalization aliases using the destination filesystem itself,
+/// before any overwrite/truncation. Rust Unicode normalization cannot model all
+/// APFS/HFS+ lookup rules. Fresh entries avoid a directory scan entirely.
+#[cfg(target_os = "macos")]
+fn verify_native_name(parent: RawFd, name: &CStr) -> Result<(), Error> {
+    match nix::sys::stat::fstatat(Some(parent), name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Err(nix::errno::Errno::ENOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let mut directory = Dir::openat(
+        Some(parent),
+        c".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    for entry in directory.iter() {
+        if entry?.file_name().to_bytes() == name.to_bytes() {
+            return Ok(());
+        }
+    }
+    bail!(
+        "destination filename alias/collision for {name:?}; use a filesystem that represents the archive names distinctly"
+    )
 }

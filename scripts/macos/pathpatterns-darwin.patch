@@ -1,0 +1,140 @@
+diff --git a/src/match_list.rs b/src/match_list.rs
+index f9f67f0..fa27899 100644
+--- a/src/match_list.rs
++++ b/src/match_list.rs
+@@ -255,7 +255,7 @@ impl MatchEntry {
+             return true;
+         }
+ 
+-        let flag = match file_mode & libc::S_IFMT {
++        let flag = match (file_mode as libc::mode_t) & libc::S_IFMT {
+             libc::S_IFDIR => MatchFlag::MATCH_DIRECTORIES,
+             libc::S_IFREG => MatchFlag::MATCH_REGULAR_FILES,
+             libc::S_IFLNK => MatchFlag::MATCH_SYMLINKS,
+@@ -514,27 +514,33 @@ fn test_file_type_matches() {
+             .unwrap(),
+     ];
+     assert_eq!(
+-        matchlist.matches("a_dir", Some(libc::S_IFDIR)),
++        matchlist.matches("a_dir", Some(libc::S_IFDIR as u32)),
+         Ok(Some(MatchType::Include))
+     );
+     assert_eq!(
+-        matchlist.matches("/a_dir", Some(libc::S_IFDIR)),
++        matchlist.matches("/a_dir", Some(libc::S_IFDIR as u32)),
+         Ok(Some(MatchType::Include))
+     );
+-    assert_eq!(matchlist.matches("/a_dir", Some(libc::S_IFREG)), Ok(None));
++    assert_eq!(
++        matchlist.matches("/a_dir", Some(libc::S_IFREG as u32)),
++        Ok(None)
++    );
+ 
+     assert_eq!(
+-        matchlist.matches("/a_file", Some(libc::S_IFREG)),
++        matchlist.matches("/a_file", Some(libc::S_IFREG as u32)),
+         Ok(Some(MatchType::Exclude))
+     );
+-    assert_eq!(matchlist.matches("/a_file", Some(libc::S_IFDIR)), Ok(None));
++    assert_eq!(
++        matchlist.matches("/a_file", Some(libc::S_IFDIR as u32)),
++        Ok(None)
++    );
+ 
+     assert_eq!(
+-        matchlist.matches("/another_dir", Some(libc::S_IFDIR)),
++        matchlist.matches("/another_dir", Some(libc::S_IFDIR as u32)),
+         Ok(Some(MatchType::Exclude))
+     );
+     assert_eq!(
+-        matchlist.matches("/another_dir", Some(libc::S_IFREG)),
++        matchlist.matches("/another_dir", Some(libc::S_IFREG as u32)),
+         Ok(None)
+     );
+ }
+@@ -634,7 +640,7 @@ fn matches_path() {
+     let mut test = 1;
+     let result = matchlist.matches("bhshdf", || {
+         test += 1;
+-        Ok::<u32, FileModeRequired>(libc::S_IFDIR)
++        Ok::<u32, FileModeRequired>(libc::S_IFDIR as u32)
+     });
+     assert_eq!(result, Ok(Some(MatchType::Exclude)));
+     assert_eq!(test, 1);
+@@ -648,7 +654,7 @@ fn matches_path() {
+     let mut test = 1;
+     let result = matchlist.matches("aa", || {
+         test += 1;
+-        Ok::<u32, FileModeRequired>(libc::S_IFDIR)
++        Ok::<u32, FileModeRequired>(libc::S_IFDIR as u32)
+     });
+     assert_eq!(result, Ok(Some(MatchType::Exclude)));
+     assert_eq!(test, 2);
+@@ -661,7 +667,9 @@ fn matches_path() {
+         Ok(Some(MatchType::Exclude))
+     );
+     assert_eq!(
+-        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFREG)),
++        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFREG as u32
++        )),
+         Ok(None)
+     );
+ 
+@@ -679,15 +687,19 @@ fn matches_path() {
+         Err(FileModeRequired)
+     );
+     assert_eq!(
+-        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFDIR)),
++        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFDIR as u32
++        )),
+         Ok(Some(MatchType::Exclude))
+     );
+     assert_eq!(
+-        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFREG)),
++        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFREG as u32
++        )),
+         Ok(None)
+     );
+     assert_eq!(
+-        matchlist.matches("bbb", || Ok::<u32, FileModeRequired>(libc::S_IFREG)),
++        matchlist.matches("bbb", || Ok::<u32, FileModeRequired>(libc::S_IFREG as u32)),
+         Ok(Some(MatchType::Include))
+     );
+ 
+@@ -697,7 +709,7 @@ fn matches_path() {
+     ];
+ 
+     assert_eq!(
+-        matchlist.matches("bbb", || Ok::<u32, FileModeRequired>(libc::S_IFDIR)),
++        matchlist.matches("bbb", || Ok::<u32, FileModeRequired>(libc::S_IFDIR as u32)),
+         Ok(None)
+     );
+ 
+@@ -709,15 +721,21 @@ fn matches_path() {
+     ];
+ 
+     assert_eq!(
+-        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFDIR)),
++        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFDIR as u32
++        )),
+         Ok(Some(MatchType::Exclude))
+     );
+     assert_eq!(
+-        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFREG)),
++        matchlist.matches("ahsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFREG as u32
++        )),
+         Ok(None)
+     );
+     assert_eq!(
+-        matchlist.matches("bhsjdj", || Ok::<u32, FileModeRequired>(libc::S_IFREG)),
++        matchlist.matches("bhsjdj", || Ok::<u32, FileModeRequired>(
++            libc::S_IFREG as u32
++        )),
+         Ok(Some(MatchType::Exclude))
+     );
+     assert_eq!(

@@ -23,6 +23,8 @@ pub mod sha;
 /// running backup jobs. We measured a reduction by a factor of 10-20 in experiments and see much
 /// less erratic behavior in the overall's runtime RSS size.
 pub fn setup_libc_malloc_opts() {
+    // Darwin uses its native allocator and has no glibc mallopt interface.
+    #[cfg(target_env = "gnu")]
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 4096 * 32);
     }

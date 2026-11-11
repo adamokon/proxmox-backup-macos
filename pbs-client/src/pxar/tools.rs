@@ -29,7 +29,7 @@ use crate::{BackupReader, RemoteChunkReader};
 pub(crate) fn perms_from_metadata(meta: &Metadata) -> Result<Mode, Error> {
     let mode = meta.stat.get_permission_bits();
 
-    u32::try_from(mode)
+    libc::mode_t::try_from(mode)
         .context("couldn't narrow permission bits")
         .and_then(|mode| {
             Mode::from_bits(mode)

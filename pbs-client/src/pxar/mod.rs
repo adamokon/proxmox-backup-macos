@@ -48,9 +48,19 @@
 //! linked `ENTRY`.
 
 pub(crate) mod create;
+#[cfg(target_os = "macos")]
+mod darwin;
+#[cfg(target_os = "macos")]
+pub mod darwin_archive;
+#[cfg(target_os = "macos")]
+mod darwin_metadata;
 pub(crate) mod dir_stack;
 pub(crate) mod extract;
 pub(crate) mod look_ahead_cache;
+#[cfg(not(target_os = "macos"))]
+pub(crate) mod metadata;
+#[cfg(target_os = "macos")]
+#[path = "metadata_macos.rs"]
 pub(crate) mod metadata;
 pub mod tools;
 

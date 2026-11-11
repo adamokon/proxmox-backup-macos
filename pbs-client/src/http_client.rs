@@ -11,7 +11,7 @@ use hyper::header::SET_COOKIE;
 use hyper::http::Uri;
 use hyper::http::header::HeaderValue;
 use hyper::http::{Request, Response};
-#[cfg(not(target_feature = "crt-static"))]
+#[cfg(not(all(target_os = "linux", target_feature = "crt-static")))]
 use hyper_util::client::legacy::connect::dns::GaiResolver;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -41,13 +41,13 @@ use pbs_api_types::{Authid, RateLimitConfig, Userid};
 use super::PROXMOX_BACKUP_TCP_KEEPALIVE_TIME;
 use super::pipe_to_stream::PipeToSendStream;
 
-#[cfg(not(target_feature = "crt-static"))]
+#[cfg(not(all(target_os = "linux", target_feature = "crt-static")))]
 type DnsResolver = GaiResolver;
 
-#[cfg(target_feature = "crt-static")]
+#[cfg(all(target_os = "linux", target_feature = "crt-static"))]
 type DnsResolver = resolver::HickoryDnsResolver;
 
-#[cfg(target_feature = "crt-static")]
+#[cfg(all(target_os = "linux", target_feature = "crt-static"))]
 mod resolver {
     use std::net::SocketAddr;
     use std::pin::Pin;

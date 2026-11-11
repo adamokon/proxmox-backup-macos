@@ -1,0 +1,55 @@
+name: Client format portability
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  linux-formats:
+    # Own branches are already checked on push; keep PR runs for external forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Official v7.0.1, release and commit checked 2026-10-24.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      # Install an explicit Rust release, not the moving stable toolchain.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.99.1
+      - name: Install Linux development libraries
+        timeout-minutes: 5
+        run: |
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://mirrors.kernel.org/ubuntu/dists/noble/InRelease -o /dev/null
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://mirrors.kernel.org/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 -o APT::Update::Error-Mode=any update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 install -y --no-install-recommends pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev libfuse3-dev
+      - run: python3 scripts/macos/apply-patches.py
+      # Run outside the source tree to avoid the upstream Debian Cargo redirect.
+      - name: Test original format code with server dependencies disabled
+        working-directory: ${{ runner.temp }}
+        run: cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-datastore --no-default-features
+      - name: Test path matching and Unix memory mapping regression
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package endian_trait
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pathpatterns
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-sys maps_4096_byte_header_on_native_page_size
+      - name: Test upstream key, PXAR range and CLI status regressions
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-key-config
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package pbs-client --lib lookup_dynamic_entries_range_end_check
+          cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client --bin proxmox-backup-client status_percentage_handles_restricted_and_malformed_values
+      - name: Check Linux client compilation
+        working-directory: ${{ runner.temp }}
+        run: cargo check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client
+      - name: Check declared minimum Rust version
+        working-directory: ${{ runner.temp }}
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          cargo +1.91.0 check --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked --package proxmox-backup-client

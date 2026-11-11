@@ -1,0 +1,169 @@
+diff --git a/proxmox-sys/src/mmap.rs b/proxmox-sys/src/mmap.rs
+index e15ca1db..4b96fa27 100644
+--- a/proxmox-sys/src/mmap.rs
++++ b/proxmox-sys/src/mmap.rs
+@@ -16,6 +16,8 @@ use crate::error::SysError;
+ pub struct Mmap<T> {
+     data: NonNull<T>,
+     len: usize,
++    mapping: NonNull<core::ffi::c_void>,
++    mapping_len: usize,
+ }
+ 
+ unsafe impl<T> Send for Mmap<T> where T: Send {}
+@@ -34,39 +36,55 @@ impl<T> Mmap<T> {
+         prot: mman::ProtFlags,
+         flags: mman::MapFlags,
+     ) -> io::Result<Self> {
+-        let byte_len = NonZeroUsize::new(count * mem::size_of::<T>())
++        let byte_len = count
++            .checked_mul(mem::size_of::<T>())
++            .filter(|size| *size <= isize::MAX as usize)
++            .and_then(NonZeroUsize::new)
+             .ok_or_else(|| io_format_err!("mapped length must not be zero"))?;
++        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
++            .ok()
++            .filter(|size| *size > 0)
++            .ok_or_else(|| io_format_err!("invalid system page size"))?;
++        let prefix = (ofs % page_size as u64) as usize;
++        let aligned_offset = ofs - prefix as u64;
++        let mapping_len = byte_len
++            .get()
++            .checked_add(prefix)
++            .filter(|size| *size <= isize::MAX as usize)
++            .and_then(NonZeroUsize::new)
++            .ok_or_else(|| io_format_err!("mapping length overflow"))?;
++        if ofs % mem::align_of::<T>() as u64 != 0 || page_size % mem::align_of::<T>() != 0 {
++            return Err(io_format_err!("mapped element alignment is invalid"));
++        }
+ 
+         // libc::size_t vs usize
+         #[allow(clippy::useless_conversion)]
+         let data = unsafe {
+             mman::mmap(
+                 None,
+-                byte_len,
++                mapping_len,
+                 prot,
+                 flags,
+                 fd,
+-                libc::off_t::try_from(ofs).map_err(io::Error::other)?,
++                libc::off_t::try_from(aligned_offset).map_err(io::Error::other)?,
+             )
+         }
+         .map_err(SysError::into_io_error)?;
+ 
+         Ok(Self {
+-            data: data.cast::<T>(),
++            data: unsafe {
++                NonNull::new_unchecked(data.as_ptr().cast::<u8>().add(prefix).cast::<T>())
++            },
+             len: count,
++            mapping: data,
++            mapping_len: mapping_len.get(),
+         })
+     }
+ 
+     /// Flush all in-memory contents to the backing file.
+     pub fn msync(&self, flags: mman::MsFlags) -> io::Result<()> {
+-        unsafe {
+-            mman::msync(
+-                self.data.cast::<core::ffi::c_void>(),
+-                self.len * mem::size_of::<T>(),
+-                flags,
+-            )
+-        }
+-        .map_err(SysError::into_io_error)
++        unsafe { mman::msync(self.mapping, self.mapping_len, flags) }
++            .map_err(SysError::into_io_error)
+     }
+ }
+ 
+@@ -92,10 +110,7 @@ impl<T> Drop for Mmap<T> {
+             // In theory this can fail if too many memory mappings are already present and
+             // unmapping a smaller region inside a bigger one, causing it to become split into 2
+             // regions. But then we have bigger problems already anyway, so we'll just ignore this.
+-            let _ = mman::munmap(
+-                self.data.cast::<core::ffi::c_void>(),
+-                self.len * mem::size_of::<T>(),
+-            );
++            let _ = mman::munmap(self.mapping, self.mapping_len);
+         }
+     }
+ }
+@@ -120,8 +135,75 @@ impl<T> Mmap<MaybeUninit<T>> {
+         let out = Mmap {
+             data: self.data.cast::<T>(),
+             len: self.len,
++            mapping: self.mapping,
++            mapping_len: self.mapping_len,
+         };
+         std::mem::forget(self);
+         out
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{Read, Seek, SeekFrom, Write};
++
++    #[test]
++    fn maps_4096_byte_header_on_native_page_size() {
++        let root = std::env::temp_dir().join(format!("proxmox-mmap-{}", std::process::id()));
++        std::fs::create_dir(&root).unwrap();
++        let path = root.join("index");
++        let mut file = std::fs::OpenOptions::new()
++            .create_new(true)
++            .read(true)
++            .write(true)
++            .open(&path)
++            .unwrap();
++        file.write_all(&vec![0x5a; 8192]).unwrap();
++        let mut map = unsafe {
++            Mmap::<u64>::map_fd(
++                &file,
++                4096,
++                3,
++                mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
++                mman::MapFlags::MAP_SHARED,
++            )
++            .unwrap()
++        };
++        assert_eq!(map.len(), 3);
++        assert_eq!(map[0], 0x5a5a5a5a5a5a5a5a);
++        map[2] = 0x1122334455667788;
++        map.msync(mman::MsFlags::MS_SYNC).unwrap();
++        drop(map);
++        file.seek(SeekFrom::Start(4096 + 16)).unwrap();
++        let mut value = [0; 8];
++        file.read_exact(&mut value).unwrap();
++        assert_eq!(u64::from_ne_bytes(value), 0x1122334455667788);
++        assert!(
++            unsafe {
++                Mmap::<u64>::map_fd(
++                    &file,
++                    4097,
++                    3,
++                    mman::ProtFlags::PROT_READ,
++                    mman::MapFlags::MAP_PRIVATE,
++                )
++            }
++            .is_err()
++        );
++        assert!(
++            unsafe {
++                Mmap::<u64>::map_fd(
++                    &file,
++                    0,
++                    usize::MAX,
++                    mman::ProtFlags::PROT_READ,
++                    mman::MapFlags::MAP_PRIVATE,
++                )
++            }
++            .is_err()
++        );
++        drop(file);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++}

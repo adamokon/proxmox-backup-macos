@@ -1,0 +1,14 @@
+diff --git a/proxmox-uuid/src/lib_uuid_bindings.rs b/proxmox-uuid/src/lib_uuid_bindings.rs
+index e39847e4..fb9860fa 100644
+--- a/proxmox-uuid/src/lib_uuid_bindings.rs
++++ b/proxmox-uuid/src/lib_uuid_bindings.rs
+@@ -2,7 +2,8 @@ use std::fmt;
+ 
+ use crate::Uuid;
+ 
+-#[link(name = "uuid")]
++// Darwin provides the UUID API in libSystem, rather than a separate libuuid.
++#[cfg_attr(not(target_os = "macos"), link(name = "uuid"))]
+ unsafe extern "C" {
+     pub fn uuid_generate(out: *mut [u8; 16]);
+     fn uuid_unparse_lower(input: *const [u8; 16], out: *mut u8);
