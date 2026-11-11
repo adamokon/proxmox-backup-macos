@@ -21,7 +21,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.99.1
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev libfuse3-dev
+      - name: Install Linux development libraries
+        timeout-minutes: 5
+        run: |
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 -o APT::Update::Error-Mode=any update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 install -y --no-install-recommends pkg-config libssl-dev uuid-dev libacl1-dev libsystemd-dev libfuse3-dev
       - run: python3 scripts/macos/apply-patches.py
       # Run outside the source tree to avoid the upstream Debian Cargo redirect.
       - name: Test original format code with server dependencies disabled
